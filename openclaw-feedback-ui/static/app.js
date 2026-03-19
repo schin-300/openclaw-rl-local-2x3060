@@ -44,6 +44,7 @@ const els = {
   profileCreateStatus: document.getElementById("profile-create-status"),
   profilesList: document.getElementById("profiles-list"),
   profilesEmpty: document.getElementById("profiles-empty"),
+  openAppButtons: Array.from(document.querySelectorAll("[data-open-app]")),
   appLaunchers: Array.from(document.querySelectorAll("[data-app-launch]")),
   appWindows: Array.from(document.querySelectorAll("[data-window]")),
   taskbarApps: Array.from(document.querySelectorAll("[data-task-app]")),
@@ -948,10 +949,12 @@ function closeApp(appName) {
   if (!APP_DEFINITIONS[appName]) {
     return;
   }
-  state.openApps[appName] = false;
-  state.activeApp = "";
-  setDesktopSelection("");
-  syncAppChrome();
+  if (appName !== "chat") {
+    openApp("chat");
+    return;
+  }
+  openApp("chat");
+  return;
 }
 
 els.sendButton.addEventListener("click", sendPrompt);
@@ -1005,6 +1008,12 @@ for (const taskbarButton of els.taskbarApps) {
   });
 }
 
+for (const appButton of els.openAppButtons) {
+  appButton.addEventListener("click", () => {
+    openApp(appButton.dataset.openApp);
+  });
+}
+
 for (const actionButton of els.windowActions) {
   actionButton.addEventListener("click", () => {
     const targetWindow = actionButton.dataset.targetWindow;
@@ -1019,7 +1028,7 @@ for (const actionButton of els.windowActions) {
 
 updateDesktopClock();
 window.setInterval(updateDesktopClock, 30000);
-syncAppChrome();
+openApp("chat");
 setProfileCreateStatus("Create a new saved training profile.");
 autoResizeComposer();
 
