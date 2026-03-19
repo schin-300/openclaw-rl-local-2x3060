@@ -1,20 +1,30 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
 import threading
 import time
 import uuid
+import gc
 from pathlib import Path
 from typing import Any
 
 import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from pydantic import BaseModel
+from transformers import (
+    AsyncTextIteratorStreamer,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    StoppingCriteria,
+    StoppingCriteriaList,
+)
 
 try:
     import bitsandbytes as bnb
@@ -30,6 +40,7 @@ MAX_INPUT_TOKENS = int(os.environ.get("QWEN35_MAX_INPUT_TOKENS", "2048"))
 DEFAULT_MAX_NEW_TOKENS = int(os.environ.get("QWEN35_DEFAULT_MAX_NEW_TOKENS", "192"))
 DEFAULT_TEMPERATURE = float(os.environ.get("QWEN35_DEFAULT_TEMPERATURE", "0.6"))
 DEFAULT_TOP_P = float(os.environ.get("QWEN35_DEFAULT_TOP_P", "0.9"))
+STREAM_TIMEOUT = float(os.environ.get("QWEN35_STREAM_TIMEOUT_SECONDS", "600"))
 ATTN_IMPLEMENTATION = os.environ.get("QWEN35_ATTN_IMPLEMENTATION", "sdpa")
 TRUST_REMOTE_CODE = os.environ.get("QWEN35_TRUST_REMOTE_CODE", "1").strip().lower() in {
     "1",
@@ -40,10 +51,10 @@ TRUST_REMOTE_CODE = os.environ.get("QWEN35_TRUST_REMOTE_CODE", "1").strip().lowe
 LOAD_IN_4BIT = os.environ.get("QWEN35_LOAD_IN_4BIT", "1").strip().lower() in {"1", "true", "yes", "on"}
 COMPUTE_DTYPE_NAME = os.environ.get("QWEN35_COMPUTE_DTYPE", "float16").strip().lower()
 STATE_DIR = Path(os.environ.get("QWEN35_STATE_DIR", Path(__file__).resolve().parent / "state")).expanduser()
-ADAPTER_DIR = STATE_DIR / "adapter"
-OPTIMIZER_PATH = STATE_DIR / "optimizer.pt"
-TRAIN_STATE_PATH = STATE_DIR / "train_state.json"
-FEEDBACK_LOG_PATH = STATE_DIR / "feedback.jsonl"
+PROFILES_DIR = STATE_DIR / "profiles"
+ACTIVE_PROFILE_PATH = STATE_DIR / "active_profile.txt"
+DEFAULT_PROFILE_ID = os.environ.get("QWEN35_DEFAULT_PROFILE_ID", "default").strip() or "default"
+DEFAULT_PROFILE_NAME = os.environ.get("QWEN35_DEFAULT_PROFILE_NAME", "Default").strip() or "Default"
 LORA_R = int(os.environ.get("QWEN35_LORA_R", "16"))
 LORA_ALPHA = int(os.environ.get("QWEN35_LORA_ALPHA", "32"))
 LORA_DROPOUT = float(os.environ.get("QWEN35_LORA_DROPOUT", "0.05"))
@@ -99,6 +110,240 @@ _marker_ids = None
 _loaded_at = None
 _train_state: dict[str, Any] | None = None
 _trainable_param_count = 0
+_active_profile_id: str | None = None
+
+
+class _StopOnEventCriteria(StoppingCriteria):
+    def __init__(self, stop_event: threading.Event) -> None:
+        super().__init__()
+        self._stop_event = stop_event
+
+    def __call__(self, input_ids, scores, **kwargs) -> bool:
+        return self._stop_event.is_set()
+
+
+class ProfileCreateRequest(BaseModel):
+    name: str
+
+
+class ProfileSelectRequest(BaseModel):
+    profile_id: str
+
+
+def _slugify_profile_id(name: str) -> str:
+    lowered = name.strip().lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", lowered).strip("-")
+    return slug or DEFAULT_PROFILE_ID
+
+
+def _profile_dir(profile_id: str) -> Path:
+    return PROFILES_DIR / profile_id
+
+
+def _profile_meta_path(profile_id: str) -> Path:
+    return _profile_dir(profile_id) / "meta.json"
+
+
+def _profile_adapter_dir(profile_id: str) -> Path:
+    return _profile_dir(profile_id) / "adapter"
+
+
+def _profile_optimizer_path(profile_id: str) -> Path:
+    return _profile_dir(profile_id) / "optimizer.pt"
+
+
+def _profile_train_state_path(profile_id: str) -> Path:
+    return _profile_dir(profile_id) / "train_state.json"
+
+
+def _profile_feedback_log_path(profile_id: str) -> Path:
+    return _profile_dir(profile_id) / "feedback.jsonl"
+
+
+def _default_profile_meta(profile_id: str, name: str, *, created_at: float | None = None) -> dict[str, Any]:
+    timestamp = created_at or time.time()
+    return {
+        "id": profile_id,
+        "name": name.strip() or profile_id,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+    }
+
+
+def _write_profile_meta(meta: dict[str, Any]) -> dict[str, Any]:
+    profile_id = str(meta["id"])
+    profile_dir = _profile_dir(profile_id)
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    meta["updated_at"] = float(meta.get("updated_at") or time.time())
+    _profile_meta_path(profile_id).write_text(
+        json.dumps(meta, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return meta
+
+
+def _load_profile_meta(profile_id: str) -> dict[str, Any]:
+    meta_path = _profile_meta_path(profile_id)
+    try:
+        payload = json.loads(meta_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        payload = _default_profile_meta(profile_id, profile_id)
+    except json.JSONDecodeError:
+        payload = _default_profile_meta(profile_id, profile_id)
+    if not isinstance(payload, dict):
+        payload = _default_profile_meta(profile_id, profile_id)
+    payload.setdefault("id", profile_id)
+    payload.setdefault("name", profile_id)
+    payload.setdefault("created_at", time.time())
+    payload.setdefault("updated_at", payload["created_at"])
+    return payload
+
+
+def _iter_profile_ids() -> list[str]:
+    if not PROFILES_DIR.exists():
+        return []
+    profile_ids: list[str] = []
+    for child in sorted(PROFILES_DIR.iterdir(), key=lambda item: item.name):
+        if child.is_dir():
+            profile_ids.append(child.name)
+    return profile_ids
+
+
+def _profile_dir_size(path: Path) -> int:
+    total = 0
+    if not path.exists():
+        return 0
+    for child in path.rglob("*"):
+        if child.is_file():
+            try:
+                total += child.stat().st_size
+            except OSError:
+                continue
+    return total
+
+
+def _read_active_profile_id() -> str:
+    try:
+        profile_id = ACTIVE_PROFILE_PATH.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return DEFAULT_PROFILE_ID
+    return profile_id or DEFAULT_PROFILE_ID
+
+
+def _write_active_profile_id(profile_id: str) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    ACTIVE_PROFILE_PATH.write_text(f"{profile_id}\n", encoding="utf-8")
+
+
+def _ensure_profile_storage_initialized() -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+
+    profile_ids = [child.name for child in PROFILES_DIR.iterdir() if child.is_dir()]
+    legacy_paths = [
+        STATE_DIR / "adapter",
+        STATE_DIR / "optimizer.pt",
+        STATE_DIR / "train_state.json",
+        STATE_DIR / "feedback.jsonl",
+    ]
+    has_legacy_root_state = any(path.exists() for path in legacy_paths)
+    default_dir = _profile_dir(DEFAULT_PROFILE_ID)
+
+    if not profile_ids:
+        default_meta = _default_profile_meta(DEFAULT_PROFILE_ID, DEFAULT_PROFILE_NAME)
+        default_dir.mkdir(parents=True, exist_ok=True)
+        _write_profile_meta(default_meta)
+
+        if has_legacy_root_state:
+            move_targets = {
+                STATE_DIR / "adapter": _profile_adapter_dir(DEFAULT_PROFILE_ID),
+                STATE_DIR / "optimizer.pt": _profile_optimizer_path(DEFAULT_PROFILE_ID),
+                STATE_DIR / "train_state.json": _profile_train_state_path(DEFAULT_PROFILE_ID),
+                STATE_DIR / "feedback.jsonl": _profile_feedback_log_path(DEFAULT_PROFILE_ID),
+            }
+            for source, destination in move_targets.items():
+                if source.exists() and not destination.exists():
+                    source.replace(destination)
+
+    if not _profile_meta_path(DEFAULT_PROFILE_ID).exists():
+        _write_profile_meta(_default_profile_meta(DEFAULT_PROFILE_ID, DEFAULT_PROFILE_NAME))
+
+    active_profile_id = _read_active_profile_id()
+    if active_profile_id not in _iter_profile_ids():
+        active_profile_id = DEFAULT_PROFILE_ID
+        _write_active_profile_id(active_profile_id)
+
+
+def _get_active_profile_id() -> str:
+    global _active_profile_id
+    _ensure_profile_storage_initialized()
+    if _active_profile_id is None:
+        _active_profile_id = _read_active_profile_id()
+    if _active_profile_id not in _iter_profile_ids():
+        _active_profile_id = DEFAULT_PROFILE_ID
+        _write_active_profile_id(_active_profile_id)
+    return _active_profile_id
+
+
+def _active_profile_dir() -> Path:
+    return _profile_dir(_get_active_profile_id())
+
+
+def _active_adapter_dir() -> Path:
+    return _profile_adapter_dir(_get_active_profile_id())
+
+
+def _active_optimizer_path() -> Path:
+    return _profile_optimizer_path(_get_active_profile_id())
+
+
+def _active_train_state_path() -> Path:
+    return _profile_train_state_path(_get_active_profile_id())
+
+
+def _active_feedback_log_path() -> Path:
+    return _profile_feedback_log_path(_get_active_profile_id())
+
+
+def _profile_summary(profile_id: str) -> dict[str, Any]:
+    meta = _load_profile_meta(profile_id)
+    train_state = _load_train_state(_profile_train_state_path(profile_id))
+    profile_dir = _profile_dir(profile_id)
+    size_bytes = _profile_dir_size(profile_dir)
+    return {
+        "id": profile_id,
+        "name": str(meta.get("name") or profile_id),
+        "created_at": meta.get("created_at"),
+        "updated_at": meta.get("updated_at"),
+        "size_bytes": size_bytes,
+        "adapter_ready": (_profile_adapter_dir(profile_id) / "adapter_config.json").exists(),
+        "training": train_state,
+    }
+
+
+def _reset_loaded_runtime() -> None:
+    global _model, _optimizer, _train_state, _loaded_at, _trainable_param_count
+    _model = None
+    _optimizer = None
+    _train_state = None
+    _loaded_at = None
+    _trainable_param_count = 0
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _activate_profile(profile_id: str, *, load_model: bool = True) -> dict[str, Any]:
+    global _active_profile_id
+    _ensure_profile_storage_initialized()
+    if profile_id not in _iter_profile_ids():
+        raise HTTPException(status_code=404, detail=f"Unknown profile: {profile_id}")
+    _active_profile_id = profile_id
+    _write_active_profile_id(profile_id)
+    _reset_loaded_runtime()
+    if load_model:
+        _load_model()
+    return _profile_summary(profile_id)
 
 
 def _compute_dtype() -> torch.dtype:
@@ -121,9 +366,10 @@ def _default_train_state() -> dict[str, Any]:
     }
 
 
-def _load_train_state() -> dict[str, Any]:
+def _load_train_state(path: Path | None = None) -> dict[str, Any]:
+    train_state_path = path or _active_train_state_path()
     try:
-        raw = json.loads(TRAIN_STATE_PATH.read_text(encoding="utf-8"))
+        raw = json.loads(train_state_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return _default_train_state()
     except json.JSONDecodeError:
@@ -138,13 +384,18 @@ def _load_train_state() -> dict[str, Any]:
 def _save_train_state() -> None:
     if _train_state is None:
         return
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    TRAIN_STATE_PATH.write_text(json.dumps(_train_state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    active_dir = _active_profile_dir()
+    active_dir.mkdir(parents=True, exist_ok=True)
+    _active_train_state_path().write_text(
+        json.dumps(_train_state, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _append_feedback_log(entry: dict[str, Any]) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with FEEDBACK_LOG_PATH.open("a", encoding="utf-8") as handle:
+    active_dir = _active_profile_dir()
+    active_dir.mkdir(parents=True, exist_ok=True)
+    with _active_feedback_log_path().open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
@@ -252,6 +503,56 @@ def _strip_thinking(text: str) -> str:
     return cleaned.strip()
 
 
+def _strip_thinking_partial(text: str, *, final: bool) -> str:
+    cleaned = text.replace("<|im_end|>", "").replace("<|endoftext|>", "")
+    cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL)
+
+    open_idx = cleaned.rfind("<think>")
+    close_idx = cleaned.rfind("</think>")
+    if open_idx != -1 and open_idx > close_idx:
+        cleaned = cleaned[:open_idx]
+
+    if not final:
+        tail_lt = cleaned.rfind("<")
+        tail_gt = cleaned.rfind(">")
+        if tail_lt > tail_gt and len(cleaned) - tail_lt <= 32:
+            cleaned = cleaned[:tail_lt]
+        return cleaned.lstrip()
+
+    cleaned = re.sub(r"^\s*<think>\s*</think>\s*", "", cleaned, flags=re.DOTALL)
+    return cleaned.strip()
+
+
+def _generation_kwargs(
+    *,
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    streamer: AsyncTextIteratorStreamer | None = None,
+    stop_event: threading.Event | None = None,
+) -> dict[str, Any]:
+    do_sample = temperature > 0.0
+    generation_kwargs: dict[str, Any] = {
+        "max_new_tokens": max_tokens,
+        "do_sample": do_sample,
+        "use_cache": True,
+        "pad_token_id": _tokenizer.pad_token_id or _tokenizer.eos_token_id,
+        "eos_token_id": _tokenizer.eos_token_id,
+    }
+    if do_sample:
+        generation_kwargs["temperature"] = temperature
+        generation_kwargs["top_p"] = top_p
+    if streamer is not None:
+        generation_kwargs["streamer"] = streamer
+    if stop_event is not None:
+        generation_kwargs["stopping_criteria"] = StoppingCriteriaList([_StopOnEventCriteria(stop_event)])
+    return generation_kwargs
+
+
+def _sse_data(payload: dict[str, Any]) -> str:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
 def _score_to_reward(score: int) -> float:
     return _EXPLICIT_FEEDBACK_REWARD_BY_SCORE.get(score, 0.0)
 
@@ -286,10 +587,11 @@ def _move_optimizer_state_to_device(device: torch.device) -> None:
 def _save_adapter_checkpoint() -> None:
     if _model is None:
         return
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    _model.save_pretrained(ADAPTER_DIR)
+    active_dir = _active_profile_dir()
+    active_dir.mkdir(parents=True, exist_ok=True)
+    _model.save_pretrained(_active_adapter_dir())
     if _optimizer is not None:
-        torch.save(_optimizer.state_dict(), OPTIMIZER_PATH)
+        torch.save(_optimizer.state_dict(), _active_optimizer_path())
     _save_train_state()
 
 
@@ -299,7 +601,10 @@ def _load_model() -> None:
     if _model is not None and _tokenizer is not None and _optimizer is not None and _train_state is not None:
         return
 
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    _ensure_profile_storage_initialized()
+    active_profile_id = _get_active_profile_id()
+    active_dir = _profile_dir(active_profile_id)
+    active_dir.mkdir(parents=True, exist_ok=True)
 
     if torch.cuda.is_available():
         torch.set_float32_matmul_precision("high")
@@ -335,18 +640,21 @@ def _load_model() -> None:
     if hasattr(base_model, "config"):
         base_model.config.use_cache = False
 
-    adapter_config_path = ADAPTER_DIR / "adapter_config.json"
+    adapter_dir = _profile_adapter_dir(active_profile_id)
+    optimizer_path = _profile_optimizer_path(active_profile_id)
+    train_state_path = _profile_train_state_path(active_profile_id)
+    adapter_config_path = adapter_dir / "adapter_config.json"
     if adapter_config_path.exists():
-        _model = PeftModel.from_pretrained(base_model, ADAPTER_DIR, is_trainable=True)
+        _model = PeftModel.from_pretrained(base_model, adapter_dir, is_trainable=True)
     else:
         _model = get_peft_model(base_model, _lora_config())
 
     _optimizer = _build_optimizer(_model)
-    _train_state = _load_train_state()
+    _train_state = _load_train_state(train_state_path)
     _trainable_param_count = sum(param.numel() for param in _model.parameters() if param.requires_grad)
 
-    if OPTIMIZER_PATH.exists():
-        optimizer_state = torch.load(OPTIMIZER_PATH, map_location="cpu")
+    if optimizer_path.exists():
+        optimizer_state = torch.load(optimizer_path, map_location="cpu")
         _optimizer.load_state_dict(optimizer_state)
         _move_optimizer_state_to_device(_first_model_device())
 
@@ -415,23 +723,17 @@ def _generate_chat_completion(body: dict[str, Any]) -> dict[str, Any]:
     max_tokens = max(1, min(max_tokens, 1024))
     temperature = float(body.get("temperature") if body.get("temperature") is not None else DEFAULT_TEMPERATURE)
     top_p = float(body.get("top_p") if body.get("top_p") is not None else DEFAULT_TOP_P)
-    do_sample = temperature > 0.0
 
     with _model_lock:
         _load_model()
         _model.eval()
         inputs = _build_inputs(messages)
         prompt_len = int(inputs["input_ids"].shape[-1])
-        generation_kwargs = {
-            "max_new_tokens": max_tokens,
-            "do_sample": do_sample,
-            "use_cache": True,
-            "pad_token_id": _tokenizer.pad_token_id or _tokenizer.eos_token_id,
-            "eos_token_id": _tokenizer.eos_token_id,
-        }
-        if do_sample:
-            generation_kwargs["temperature"] = temperature
-            generation_kwargs["top_p"] = top_p
+        generation_kwargs = _generation_kwargs(
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+        )
         with torch.inference_mode():
             generated = _model.generate(**inputs, **generation_kwargs)
 
@@ -467,6 +769,128 @@ def _generate_chat_completion(body: dict[str, Any]) -> dict[str, Any]:
             "total_tokens": prompt_len + completion_tokens,
         },
     }
+
+
+async def _stream_chat_completion(body: dict[str, Any]):
+    messages = _normalize_messages(body.get("messages"))
+    max_tokens = int(body.get("max_tokens") or DEFAULT_MAX_NEW_TOKENS)
+    max_tokens = max(1, min(max_tokens, 1024))
+    temperature = float(body.get("temperature") if body.get("temperature") is not None else DEFAULT_TEMPERATURE)
+    top_p = float(body.get("top_p") if body.get("top_p") is not None else DEFAULT_TOP_P)
+    response_id = f"chatcmpl-{uuid.uuid4().hex}"
+    created_at = int(time.time())
+    stop_event = threading.Event()
+    thread_error: dict[str, BaseException] = {}
+
+    with _model_lock:
+        _load_model()
+        _model.eval()
+        inputs = _build_inputs(messages)
+        prompt_len = int(inputs["input_ids"].shape[-1])
+        streamer = AsyncTextIteratorStreamer(
+            _tokenizer,
+            skip_prompt=True,
+            skip_special_tokens=False,
+            timeout=STREAM_TIMEOUT,
+        )
+        generation_kwargs = _generation_kwargs(
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            streamer=streamer,
+            stop_event=stop_event,
+        )
+
+        def _run_generate() -> None:
+            try:
+                with torch.inference_mode():
+                    _model.generate(**inputs, **generation_kwargs)
+            except BaseException as exc:  # pragma: no cover - background execution
+                thread_error["error"] = exc
+                try:
+                    streamer.end()
+                except Exception:
+                    pass
+
+        worker = threading.Thread(target=_run_generate, name="qwen35-stream-generate", daemon=True)
+        worker.start()
+
+        raw_text = ""
+        visible_text = ""
+        sent_role = False
+
+        try:
+            async for piece in streamer:
+                raw_text += piece
+                next_visible = _strip_thinking_partial(raw_text, final=False)
+                if next_visible.startswith(visible_text):
+                    delta = next_visible[len(visible_text) :]
+                else:
+                    delta = next_visible
+                visible_text = next_visible
+                if not delta:
+                    continue
+                chunk_delta: dict[str, Any] = {"content": delta}
+                if not sent_role:
+                    chunk_delta["role"] = "assistant"
+                    sent_role = True
+                yield _sse_data(
+                    {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_at,
+                        "model": SERVED_MODEL_NAME,
+                        "choices": [{"index": 0, "delta": chunk_delta, "finish_reason": None}],
+                    }
+                )
+
+            await asyncio.to_thread(worker.join, 5.0)
+            if thread_error.get("error") is not None:
+                raise thread_error["error"]
+
+            final_visible = _strip_thinking_partial(raw_text, final=True)
+            if final_visible.startswith(visible_text):
+                trailing = final_visible[len(visible_text) :]
+            else:
+                trailing = final_visible
+            visible_text = final_visible
+
+            if trailing:
+                chunk_delta = {"content": trailing}
+                if not sent_role:
+                    chunk_delta["role"] = "assistant"
+                    sent_role = True
+                yield _sse_data(
+                    {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_at,
+                        "model": SERVED_MODEL_NAME,
+                        "choices": [{"index": 0, "delta": chunk_delta, "finish_reason": None}],
+                    }
+                )
+
+            if not visible_text:
+                raise HTTPException(status_code=502, detail="Model returned an empty response")
+
+            yield _sse_data(
+                {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_at,
+                    "model": SERVED_MODEL_NAME,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                }
+            )
+            yield "data: [DONE]\n\n"
+        except asyncio.CancelledError:  # pragma: no cover - client disconnect path
+            stop_event.set()
+            raise
+        finally:
+            stop_event.set()
+            await asyncio.to_thread(worker.join, 1.0)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 def _train_on_feedback(body: dict[str, Any]) -> dict[str, Any]:
@@ -542,6 +966,7 @@ def _train_on_feedback(body: dict[str, Any]) -> dict[str, Any]:
         _append_feedback_log(
             {
                 "created_at": time.time(),
+                "profile_id": _get_active_profile_id(),
                 "session_id": session_id,
                 "model": SERVED_MODEL_NAME,
                 "model_id": MODEL_ID,
@@ -585,6 +1010,7 @@ def startup_event() -> None:
 
 @app.get("/health")
 def health() -> JSONResponse:
+    active_profile_id = _get_active_profile_id()
     loaded = _model is not None and _tokenizer is not None and _optimizer is not None and _train_state is not None
     detail = {
         "status": "ok" if loaded else "loading",
@@ -596,13 +1022,77 @@ def health() -> JSONResponse:
         "default_max_new_tokens": DEFAULT_MAX_NEW_TOKENS,
         "train_max_response_tokens": TRAIN_MAX_RESPONSE_TOKENS,
         "loaded_at": _loaded_at,
+        "active_profile_id": active_profile_id,
+        "active_profile": _profile_summary(active_profile_id),
         "compute_dtype": str(_compute_dtype()).replace("torch.", ""),
-        "adapter_dir": str(ADAPTER_DIR),
-        "adapter_ready": (ADAPTER_DIR / "adapter_config.json").exists(),
+        "adapter_dir": str(_active_adapter_dir()),
+        "adapter_ready": (_active_adapter_dir() / "adapter_config.json").exists(),
         "trainable_params": _trainable_param_count,
         "training": dict(_train_state or _default_train_state()),
     }
     return JSONResponse(detail)
+
+
+@app.get("/v1/profiles")
+def list_profiles() -> JSONResponse:
+    active_profile_id = _get_active_profile_id()
+    profiles = [_profile_summary(profile_id) for profile_id in _iter_profile_ids()]
+    return JSONResponse(
+        {
+            "ok": True,
+            "active_profile_id": active_profile_id,
+            "profiles": profiles,
+        }
+    )
+
+
+@app.post("/v1/profiles")
+def create_profile(body: ProfileCreateRequest) -> JSONResponse:
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Profile name cannot be empty")
+
+    with _model_lock:
+        _ensure_profile_storage_initialized()
+        base_slug = _slugify_profile_id(name)
+        profile_id = base_slug
+        suffix = 2
+        while profile_id in _iter_profile_ids():
+            profile_id = f"{base_slug}-{suffix}"
+            suffix += 1
+        _write_profile_meta(_default_profile_meta(profile_id, name))
+        profile = _profile_summary(profile_id)
+        profiles = [_profile_summary(existing_id) for existing_id in _iter_profile_ids()]
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "created_profile_id": profile_id,
+            "profile": profile,
+            "active_profile_id": _get_active_profile_id(),
+            "profiles": profiles,
+        }
+    )
+
+
+@app.post("/v1/profiles/select")
+def select_profile(body: ProfileSelectRequest) -> JSONResponse:
+    profile_id = body.profile_id.strip()
+    if not profile_id:
+        raise HTTPException(status_code=400, detail="profile_id cannot be empty")
+
+    with _model_lock:
+        profile = _activate_profile(profile_id, load_model=True)
+        profiles = [_profile_summary(existing_id) for existing_id in _iter_profile_ids()]
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "active_profile_id": profile_id,
+            "profile": profile,
+            "profiles": profiles,
+        }
+    )
 
 
 @app.get("/v1/models")
@@ -623,7 +1113,17 @@ def models() -> JSONResponse:
 
 
 @app.post("/v1/chat/completions")
-def chat_completions(body: dict[str, Any]) -> JSONResponse:
+async def chat_completions(body: dict[str, Any]):
+    if bool(body.get("stream", False)):
+        return StreamingResponse(
+            _stream_chat_completion(body),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
     return JSONResponse(_generate_chat_completion(body))
 
 
