@@ -31,6 +31,17 @@ def stop_global_worker():
             _global_worker = None
 
 
+def warm_start(args, data_buffer=None):
+    """Start the OpenClaw proxy before the first rollout is requested.
+
+    OpenClaw needs the OpenAI-compatible proxy to be reachable immediately so
+    users can start chatting before the trainer asks for its first batch.
+    """
+    worker = get_global_worker(args, data_buffer)
+    worker.resume_submission()
+    return worker
+
+
 class AsyncRolloutWorker:
     def __init__(self, args, data_buffer):
         self.args = args

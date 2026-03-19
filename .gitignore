@@ -225,3 +225,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local consumer-GPU fork artifacts
+models/
+ckpt/
+openclaw-rl/results/
+openclaw-feedback-ui/state/

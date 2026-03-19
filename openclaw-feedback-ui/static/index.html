@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OpenClaw-RL Feedback UI</title>
+    <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">LOCAL TRAINING CONSOLE</p>
+          <h1>OpenClaw-RL Feedback UI</h1>
+          <p class="subcopy">
+            Each answer is held for a 1 to 10 rating, plus an optional note. Those ratings and
+            comments become live reward signals for the local trainer.
+          </p>
+        </div>
+        <div class="status-panel">
+          <div class="status-chip" id="proxy-status">Checking proxy...</div>
+          <div class="model-label" id="model-label">Model</div>
+          <button class="ghost-button" id="reset-button" type="button">Reset chat</button>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <section class="transcript-panel">
+          <div class="transcript" id="transcript"></div>
+          <div class="empty-state" id="empty-state">
+            <h2>Start a turn</h2>
+            <p>
+              Send a prompt, review the model answer, then submit a <strong>1 to 10 score</strong>
+              with any optional note. The next prompt stays locked until that answer is rated.
+            </p>
+          </div>
+        </section>
+
+        <aside class="control-panel">
+          <section class="card">
+            <h2>Steering notes and scenarios</h2>
+            <p class="hint">
+              Save ongoing guidance here: pitfalls to avoid, approaches to prefer, or made-up
+              example situations you want the model to generalize from on future turns.
+            </p>
+            <textarea
+              id="guidance-input"
+              rows="8"
+              placeholder="Example: If I ask for a refactor, keep behavior stable first. If a made-up scenario involves missing details, ask one precise clarifying question instead of guessing."
+            ></textarea>
+            <button class="ghost-button full-width-button" id="guidance-save-button" type="button">
+              Save steering notes
+            </button>
+            <p class="hint save-status" id="guidance-status">Saved notes will apply to future prompts.</p>
+          </section>
+
+          <section class="card">
+            <h2>Send prompt</h2>
+            <textarea
+              id="prompt-input"
+              rows="8"
+              placeholder="Ask the local model something..."
+            ></textarea>
+            <button class="primary-button" id="send-button" type="button">Send prompt</button>
+          </section>
+
+          <section class="card pending-card" id="feedback-card">
+            <h2>Rate the last answer</h2>
+            <p class="hint">
+              Feedback closes the current training episode cleanly, then the next prompt starts a
+              fresh one while keeping this visible transcript as context.
+            </p>
+            <div class="score-picker">
+              <div class="score-value-row">
+                <div>
+                  <p class="score-caption">How good was that answer?</p>
+                  <p class="score-scale">1 = very bad, 5 = neutral, 10 = excellent</p>
+                </div>
+                <div class="score-value-wrap">
+                  <span class="score-value" id="feedback-score-value">7</span>
+                  <span class="score-total">/10</span>
+                </div>
+              </div>
+              <input
+                id="feedback-score"
+                type="range"
+                min="1"
+                max="10"
+                step="1"
+                value="7"
+              />
+            </div>
+            <textarea
+              id="feedback-note"
+              rows="5"
+              placeholder="Optional note. Example: Good overall, but it missed the edge case I mentioned."
+            ></textarea>
+            <button class="primary-button" id="feedback-submit" type="button">Submit rating</button>
+          </section>
+
+          <section class="card">
+            <h2>How this works</h2>
+            <p class="hint">
+              The UI talks directly to your local RL proxy on port <code>30000</code>. Your
+              numeric score and note are sent back as explicit feedback, so the trainer does not
+              have to guess whether the last answer was good or bad.
+            </p>
+          </section>
+        </aside>
+      </main>
+    </div>
+
+    <template id="message-template">
+      <article class="message">
+        <div class="message-head">
+          <span class="role-label"></span>
+          <span class="feedback-pill hidden"></span>
+        </div>
+        <div class="message-body"></div>
+        <details class="reasoning-block hidden">
+          <summary>Reasoning trace</summary>
+          <pre class="reasoning-body"></pre>
+        </details>
+        <div class="feedback-note hidden"></div>
+      </article>
+    </template>
+
+    <script src="/static/app.js"></script>
+  </body>
+  </html>

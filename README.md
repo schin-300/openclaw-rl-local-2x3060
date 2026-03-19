@@ -33,6 +33,32 @@
   <video src="https://github.com/user-attachments/assets/a58aacad-3c1d-47aa-bbd1-cf8c5f36de6f" controls width="200"></video>
 </p>
 
+## Local 2x3060 Fork
+
+This fork packages a practical single-machine setup for running OpenClaw-RL on **2x RTX 3060 12GB** GPUs with a lightweight online-training loop.
+
+### What This Fork Adds
+
+- A working **2-GPU local LoRA training path** for `Qwen3-0.6B`
+- A simple browser-based **feedback UI** at `http://127.0.0.1:30001`
+- **1-10 explicit reward scoring** instead of only binary good/bad feedback
+- A persistent **steering notes and scenarios** panel that injects standing guidance into future prompts
+- A host-ready **systemd user-service workflow** for keeping the local trainer and UI running
+
+### Current Local Flow
+
+1. Start the local RL stack on the machine.
+2. Chat with the model in the feedback UI.
+3. Rate each answer from `1` to `10` and optionally leave a note.
+4. Save longer-lived preferences, pitfalls, and made-up example scenarios in the steering panel.
+5. Let the local trainer update the live LoRA adapter after each rated rollout batch.
+
+### Important Notes
+
+- This repo intentionally **does not include downloaded model weights, checkpoints, or runtime state**.
+- The current consumer-GPU path is tuned for `Qwen3-0.6B`; larger models need a fresh memory-fit pass.
+- Upstream `Qwen3.5` support is **not wired in yet** in this fork.
+
 
 
 
@@ -556,6 +582,5 @@ When using OpenClaw-RL, please do not provide sensitive personal information dur
 
 
 ---
-
 
 

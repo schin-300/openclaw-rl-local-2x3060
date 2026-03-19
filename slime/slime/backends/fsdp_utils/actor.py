@@ -768,32 +768,39 @@ class FSDPTrainRayActor(TrainRayActor):
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
 
+        if self.args.offload_train:
+            self.wake_up()
+
         rollout_engines, rollout_engine_lock, num_new_engines = ray.get(
             self.rollout_manager.get_rollout_engines_and_lock.remote()
         )
-        if num_new_engines > 0:
-            self.weight_updater.connect_rollout_engines(rollout_engines, rollout_engine_lock)
-            dist.barrier(group=get_gloo_group())
-            if dist.get_rank() == 0:
-                ray.get(self.rollout_manager.clear_num_new_engines.remote())
-
-        # Merge LoRA into base weights before syncing to SGLang rollout engines.
-        # SGLang doesn't understand LoRA adapters, so it needs the merged model.
-        if self._is_lora:
-            self.model.merge_adapter()
         try:
+            if num_new_engines > 0:
+                self.weight_updater.connect_rollout_engines(rollout_engines, rollout_engine_lock)
+                dist.barrier(group=get_gloo_group())
+                if dist.get_rank() == 0:
+                    ray.get(self.rollout_manager.clear_num_new_engines.remote())
+
+            # Merge LoRA into base weights before syncing to SGLang rollout engines.
+            # In colocate mode the actor may be CPU-offloaded between train steps,
+            # so wake it first before calling into PEFT's merge path.
+            if self._is_lora:
+                self.model.merge_adapter()
+
             self.weight_updater.update_weights()
+
+            if self.args.ci_test and len(rollout_engines) > 0:
+                engine = random.choice(rollout_engines)
+                engine_version = ray.get(engine.get_weight_version.remote())
+                if str(engine_version) != str(self.weight_updater.weight_version):
+                    raise RuntimeError(
+                        f"Weight version mismatch! Engine: {engine_version}, Updater: {self.weight_updater.weight_version}"
+                    )
         finally:
             if self._is_lora:
                 self.model.unmerge_adapter()
-
-        if self.args.ci_test and len(rollout_engines) > 0:
-            engine = random.choice(rollout_engines)
-            engine_version = ray.get(engine.get_weight_version.remote())
-            if str(engine_version) != str(self.weight_updater.weight_version):
-                raise RuntimeError(
-                    f"Weight version mismatch! Engine: {engine_version}, Updater: {self.weight_updater.weight_version}"
-                )
+            if self.args.offload_train:
+                self.sleep()
 
         clear_memory()
 

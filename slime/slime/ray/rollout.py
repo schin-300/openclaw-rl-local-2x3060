@@ -73,6 +73,15 @@ class RolloutManager:
         logger.info(f"import {self.args.rollout_function_path} as generate_rollout function.")
         logger.info(f"import {self.args.eval_function_path} as eval_generate_rollout function.")
 
+        warm_start = getattr(
+            __import__(self.generate_rollout.__module__, fromlist=["warm_start"]),
+            "warm_start",
+            None,
+        )
+        if callable(warm_start):
+            warm_start(self.args, self.data_source)
+            logger.info(f"warm-started rollout module {self.generate_rollout.__module__}")
+
         if self.args.debug_train_only:
             self.all_rollout_engines = []
         else:

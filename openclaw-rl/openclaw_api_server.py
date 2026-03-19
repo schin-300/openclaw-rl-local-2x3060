@@ -26,8 +26,29 @@ _RESET = "\033[0m"
 logger = logging.getLogger(__name__)
 
 _BOXED_RE = re.compile(r"\\boxed\{([-+]?\d)\}")
+_EXPLICIT_FEEDBACK_RE = re.compile(r"\[openclaw feedback\]\s*score=(10|[1-9])/10\b", re.IGNORECASE)
+_EXPLICIT_FEEDBACK_COMMENT_RE = re.compile(r"Comment:\s*(.+)$", re.IGNORECASE | re.DOTALL)
+_EXPLICIT_FEEDBACK_REWARD_BY_SCORE = {
+    1: -1.00,
+    2: -0.92,
+    3: -0.68,
+    4: -0.30,
+    5: 0.00,
+    6: 0.18,
+    7: 0.45,
+    8: 0.78,
+    9: 0.94,
+    10: 1.00,
+}
 
 _NON_STANDARD_BODY_KEYS = {"session_id", "session_done", "turn_type"}
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _flatten_message_content(content):
@@ -138,6 +159,34 @@ def _majority_vote(scores: list[int | None]) -> float:
     return float(top[0])
 
 
+def _explicit_feedback_score_to_reward(ui_score: int) -> float:
+    # Deliberately steep near the edges so 8/9/10 and 1/2/3 move the
+    # policy much more than middle-of-the-road feedback.
+    return _EXPLICIT_FEEDBACK_REWARD_BY_SCORE.get(ui_score, 0.0)
+
+
+def _extract_explicit_feedback(next_state: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not next_state:
+        return None
+    text = _flatten_message_content(next_state.get("content")).strip()
+    if not text:
+        return None
+
+    match = _EXPLICIT_FEEDBACK_RE.search(text)
+    if not match:
+        return None
+
+    ui_score = int(match.group(1))
+    comment_match = _EXPLICIT_FEEDBACK_COMMENT_RE.search(text)
+    comment = comment_match.group(1).strip() if comment_match else ""
+    return {
+        "ui_score": ui_score,
+        "score": _explicit_feedback_score_to_reward(ui_score),
+        "comment": comment,
+        "raw_text": text,
+    }
+
+
 async def reward_func(args, sample_or_samples, **kwargs):
     if isinstance(sample_or_samples, list):
         return [{"score": s.reward.get("score", 0.0) if isinstance(s.reward, dict) else 0.0}
@@ -193,8 +242,10 @@ class OpenClawAPIServer:
         self.output_queue = output_queue
         self.submission_enabled = submission_enabled
         self.tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
+        self.sglang_router_base_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
         self.sglang_chat_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/v1/chat/completions"
         self.sglang_health_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/health"
+        self.sglang_workers_url = f"{self.sglang_router_base_url}/workers"
         self.expected_api_key = os.getenv("SGLANG_API_KEY", "")
         self.host = os.getenv("HOST", "0.0.0.0")
         self.port = int(os.getenv("PORT", "30000"))
@@ -208,18 +259,28 @@ class OpenClawAPIServer:
         self._pending_turn_data: dict[str, dict[int, dict]] = {}  # session → {turn → turn_data}
         self._session_effective: dict[str, int] = {}  # session → count of samples with loss_mask=[1]
 
-        self._prm_enabled = getattr(args, "prm_enable", False)
+        self._shared_policy_prm = _env_flag("OPENCLAW_PRM_SHARED_POLICY", False)
+        self._prm_enabled = getattr(args, "prm_enable", False) or self._shared_policy_prm
         self._prm_m = int(os.getenv("PRM_M", getattr(args, "prm_m", 3)))
         self._prm_temperature = float(getattr(args, "prm_temperature", 0.6))
         self._prm_max_tokens = int(getattr(args, "prm_max_new_tokens", 4096))
         prm_ip = getattr(args, "prm_router_ip", None)
         prm_port = getattr(args, "prm_router_port", None)
-        self._prm_url = f"http://{prm_ip}:{prm_port}/generate" if prm_ip and prm_port else ""
+        shared_prm_url = (os.getenv("OPENCLAW_PRM_URL") or "").strip()
+        if shared_prm_url:
+            self._prm_url = shared_prm_url
+        elif getattr(args, "prm_enable", False) and prm_ip and prm_port:
+            self._prm_url = f"http://{prm_ip}:{prm_port}/generate"
+        elif self._shared_policy_prm:
+            self._prm_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+        else:
+            self._prm_url = ""
         self._prm_tokenizer = None
         if self._prm_enabled:
             prm_path = getattr(args, "prm_model_path", None) or args.hf_checkpoint
             self._prm_tokenizer = load_tokenizer(prm_path, trust_remote_code=True)
-            logger.info("[OpenClaw] PRM enabled: url=%s m=%d", self._prm_url, self._prm_m)
+            prm_mode = "shared-policy" if self._shared_policy_prm and not getattr(args, "prm_enable", False) else "dedicated"
+            logger.info("[OpenClaw] PRM enabled (%s): url=%s m=%d", prm_mode, self._prm_url, self._prm_m)
 
         self._eval_scores: list[float] = []
         self._eval_scores_lock = threading.Lock()
@@ -239,6 +300,12 @@ class OpenClawAPIServer:
             open(self._prm_record_file, "w").close()
             logger.info("[OpenClaw] PRM record file initialized (cleared): %s", self._prm_record_file)
 
+        self._policy_ready = False
+        self._prm_ready = not (self._prm_enabled and self._prm_url and self._prm_url != f"{self.sglang_router_base_url}/generate")
+        self._last_upstream_success_at = 0.0
+        self._last_upstream_error = ""
+        self._last_upstream_error_at = 0.0
+
         self._server: uvicorn.Server | None = None
         self._thread: threading.Thread | None = None
         self.app = self._build_app()
@@ -250,7 +317,10 @@ class OpenClawAPIServer:
 
         @app.get("/healthz")
         async def healthz():
-            return {"ok": True}
+            owner: OpenClawAPIServer = app.state.owner
+            payload = await owner._health_status()
+            status_code = 200 if payload["ok"] else 503
+            return JSONResponse(content=payload, status_code=status_code)
 
         @app.post("/v1/chat/completions")
         async def chat_completions(
@@ -292,6 +362,104 @@ class OpenClawAPIServer:
         if token != self.expected_api_key:
             raise HTTPException(status_code=401, detail="invalid api key")
 
+    def _mark_upstream_success(self):
+        self._last_upstream_success_at = time.time()
+        self._last_upstream_error = ""
+
+    def _mark_upstream_error(self, detail: str):
+        self._last_upstream_error = detail[:1000]
+        self._last_upstream_error_at = time.time()
+
+    @staticmethod
+    def _summarize_workers(workers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        keys = ("id", "url", "healthy", "is_healthy", "active", "available", "state", "circuit_state")
+        summary = []
+        for worker in workers[:4]:
+            if not isinstance(worker, dict):
+                continue
+            summary.append({key: worker.get(key) for key in keys if key in worker})
+        return summary
+
+    @staticmethod
+    def _count_healthy_workers(workers: list[dict[str, Any]]) -> int | None:
+        health_values: list[bool] = []
+        for worker in workers:
+            if not isinstance(worker, dict):
+                continue
+            for key in ("healthy", "is_healthy", "active", "available"):
+                value = worker.get(key)
+                if isinstance(value, bool):
+                    health_values.append(value)
+                    break
+        if not health_values:
+            return None
+        return sum(health_values)
+
+    def _router_worker_status_sync(self) -> dict[str, Any]:
+        try:
+            response = httpx.get(self.sglang_workers_url, timeout=5)
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as exc:
+            return {
+                "reachable": False,
+                "worker_count": 0,
+                "healthy_count": None,
+                "workers": [],
+                "detail": str(exc),
+            }
+
+        workers = payload.get("workers", []) if isinstance(payload, dict) else []
+        if not isinstance(workers, list):
+            workers = []
+        return {
+            "reachable": True,
+            "worker_count": len(workers),
+            "healthy_count": self._count_healthy_workers(workers),
+            "workers": self._summarize_workers(workers),
+        }
+
+    async def _health_status(self) -> dict[str, Any]:
+        router_status = await asyncio.to_thread(self._router_worker_status_sync)
+        submission_enabled = self.submission_enabled.is_set()
+        recent_upstream_failure = bool(
+            self._last_upstream_error
+            and self._last_upstream_error_at >= self._last_upstream_success_at
+        )
+        router_ok = router_status["reachable"] and router_status["worker_count"] > 0
+        healthy_count = router_status.get("healthy_count")
+        if healthy_count is not None:
+            router_ok = router_ok and healthy_count > 0
+
+        ok = self._policy_ready and self._prm_ready and submission_enabled and router_ok and not recent_upstream_failure
+
+        reason = "ready"
+        if not self._policy_ready:
+            reason = "policy worker not ready"
+        elif not self._prm_ready:
+            reason = "prm worker not ready"
+        elif not submission_enabled:
+            reason = "submission paused for weight update"
+        elif not router_status["reachable"]:
+            reason = "router unreachable"
+        elif router_status["worker_count"] == 0:
+            reason = "no registered router workers"
+        elif healthy_count is not None and healthy_count == 0:
+            reason = "no healthy router workers"
+        elif recent_upstream_failure:
+            reason = self._last_upstream_error or "recent upstream failure"
+
+        return {
+            "ok": ok,
+            "reason": reason,
+            "submission_enabled": submission_enabled,
+            "policy_ready": self._policy_ready,
+            "prm_ready": self._prm_ready,
+            "router": router_status,
+            "last_upstream_success_at": self._last_upstream_success_at or None,
+            "last_upstream_error": self._last_upstream_error or None,
+        }
+
     # ---------------------------------------------------- record file
     def _flush_pending_record(self, session_id: str, next_state):
         """Write out the buffered record for *session_id* with its next_state and fire PRM."""
@@ -299,6 +467,9 @@ class OpenClawAPIServer:
         if rec is None:
             return
         rec["next_state"] = next_state
+        explicit_feedback = _extract_explicit_feedback(next_state)
+        if explicit_feedback:
+            rec["explicit_feedback"] = explicit_feedback
         if next_state:
             ns_role = next_state.get("role", "?")
             ns_content = _flatten_message_content(next_state.get("content"))
@@ -307,7 +478,21 @@ class OpenClawAPIServer:
                 f"next_state role={ns_role} len={len(ns_content)}: "
                 f"{ns_content[:200]}{_RESET}"
             )
-            self._fire_prm_scoring(session_id, rec["turn"], rec["response_text"], next_state)
+            if explicit_feedback:
+                logger.info(
+                    "[OpenClaw] explicit feedback session=%s turn=%d ui_score=%d/10 reward=%.3f",
+                    session_id,
+                    rec["turn"],
+                    explicit_feedback["ui_score"],
+                    explicit_feedback["score"],
+                )
+                td = self._pending_turn_data.get(session_id, {}).get(rec["turn"])
+                if td is not None:
+                    td["has_next_state"] = True
+                    td["explicit_feedback"] = explicit_feedback
+                self._maybe_submit_ready_samples(session_id)
+            else:
+                self._fire_prm_scoring(session_id, rec["turn"], rec["response_text"], next_state)
         if self._record_file:
             try:
                 with open(self._record_file, "a", encoding="utf-8") as f:
@@ -471,16 +656,28 @@ class OpenClawAPIServer:
         if "model" not in forward_body:
             forward_body["model"] = self.served_model_name
 
-        async with httpx.AsyncClient(timeout=None) as client:
-            sglang_resp = await client.post(self.sglang_chat_url, json=forward_body)
-            if sglang_resp.status_code != 200:
-                logger.error("[OpenClaw] SGLang returned %d: %s", sglang_resp.status_code, sglang_resp.text[:1000])
-                sglang_resp.raise_for_status()
-            try:
-                output = sglang_resp.json()
-            except Exception:
-                logger.error("[OpenClaw] SGLang non-JSON body: %s", sglang_resp.text[:1000])
-                raise
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                sglang_resp = await client.post(self.sglang_chat_url, json=forward_body)
+        except Exception as exc:
+            self._mark_upstream_error(str(exc))
+            raise
+
+        if sglang_resp.status_code != 200:
+            detail = sglang_resp.text[:1000]
+            self._mark_upstream_error(detail)
+            logger.error("[OpenClaw] SGLang returned %d: %s", sglang_resp.status_code, detail)
+            sglang_resp.raise_for_status()
+
+        try:
+            output = sglang_resp.json()
+        except Exception:
+            detail = sglang_resp.text[:1000]
+            self._mark_upstream_error(detail)
+            logger.error("[OpenClaw] SGLang non-JSON body: %s", detail)
+            raise
+
+        self._mark_upstream_success()
 
         choice = output.get("choices", [{}])[0]
         assistant_msg = choice.get("message", {})
@@ -579,16 +776,29 @@ class OpenClawAPIServer:
         prm_tasks = self._prm_tasks.get(session_id, {})
         pending = self._pending_turn_data.get(session_id, {})
         for turn_num in sorted(list(pending.keys())):
+            explicit_feedback = pending[turn_num].get("explicit_feedback")
             task = prm_tasks.get(turn_num)
-            if not self._prm_enabled:
-                pass  # no PRM → submit immediately
+            if explicit_feedback is not None:
+                prm_result = {
+                    "score": explicit_feedback["score"],
+                    "source": "explicit_feedback",
+                    "ui_score": explicit_feedback["ui_score"],
+                    "comment": explicit_feedback.get("comment", ""),
+                    "raw_text": explicit_feedback.get("raw_text", ""),
+                }
+            elif not self._prm_enabled:
+                prm_result = None
             elif task is not None and not task.done():
                 continue  # PRM still running
             elif task is None and not force_no_prm:
                 continue  # waiting for next_state to fire PRM
+            else:
+                prm_result = None
+
+            if explicit_feedback is None and not self._prm_enabled:
+                pass  # no PRM → submit immediately
             turn_data = pending.pop(turn_num)
-            prm_result = None
-            if task is not None and task.done():
+            if explicit_feedback is None and task is not None and task.done():
                 try:
                     prm_result = task.result()
                 except Exception:
@@ -606,8 +816,10 @@ class OpenClawAPIServer:
         has_next_state = turn_data.get("has_next_state", False)
         if prm_result:
             score = prm_result["score"]
+            reward_source = prm_result.get("source", "prm")
         else:
             score = 0.0
+            reward_source = "no_feedback"
 
         with self._eval_scores_lock:
             self._eval_scores.append(score)
@@ -631,14 +843,18 @@ class OpenClawAPIServer:
         sample.status = Sample.Status.COMPLETED
         sample.index = next(self._index_counter)
         sample.group_index = next(self._group_counter)
-        sample.reward = {"score": score}
+        sample.reward = {"score": score, "source": reward_source}
+        if prm_result and "ui_score" in prm_result:
+            sample.reward["ui_score"] = prm_result["ui_score"]
+        if prm_result and prm_result.get("comment"):
+            sample.reward["comment"] = prm_result["comment"]
 
         if not exclude:
             self._session_effective[session_id] = self._session_effective.get(session_id, 0) + 1
 
         logger.info(
-            "[OpenClaw] submitted sample session=%s index=%d score=%.1f exclude=%s prompt_len=%d response_len=%d",
-            session_id, sample.index, score, exclude, len(prompt_ids), len(response_ids),
+            "[OpenClaw] submitted sample session=%s index=%d score=%.3f source=%s exclude=%s prompt_len=%d response_len=%d",
+            session_id, sample.index, score, reward_source, exclude, len(prompt_ids), len(response_ids),
         )
         await asyncio.to_thread(self.output_queue.put, (sample.group_index, [sample]))
 
@@ -688,26 +904,28 @@ class OpenClawAPIServer:
 
     def _wait_for_sglang_ready(self):
         while True:
-            try:
-                r = httpx.get(self.sglang_health_url, timeout=5)
-                if r.status_code == 200:
-                    break
-            except Exception:
-                pass
+            status = self._router_worker_status_sync()
+            healthy_count = status.get("healthy_count")
+            if status["reachable"] and status["worker_count"] > 0 and (healthy_count is None or healthy_count > 0):
+                self._policy_ready = True
+                break
             time.sleep(3)
         logger.info("[OpenClaw] policy server ready")
 
-        if self._prm_enabled and self._prm_url:
+        if self._prm_enabled and self._prm_url and self._prm_url != f"{self.sglang_router_base_url}/generate":
             prm_health = self._prm_url.rsplit("/", 1)[0] + "/health"
             while True:
                 try:
                     r = httpx.get(prm_health, timeout=5)
                     if r.status_code == 200:
+                        self._prm_ready = True
                         break
                 except Exception:
                     pass
                 time.sleep(3)
             logger.info("[OpenClaw] PRM server ready")
+        else:
+            self._prm_ready = True
 
         time.sleep(8)
         prm_line = ""
