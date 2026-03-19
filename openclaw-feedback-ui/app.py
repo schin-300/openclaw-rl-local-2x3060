@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import subprocess
 import time
 import uuid
@@ -51,6 +52,9 @@ PROFILES_SUPPORTED = BACKEND_MODE == "trainer_api"
 PROFILES_URL = f"{PROXY_BASE_URL}/v1/profiles"
 PROFILE_CREATE_URL = f"{PROXY_BASE_URL}/v1/profiles"
 PROFILE_SELECT_URL = f"{PROXY_BASE_URL}/v1/profiles/select"
+DEFAULT_SESSION_TITLE = "New chat"
+SESSION_TITLE_WORDS = 7
+SESSION_TITLE_MAX_CHARS = 64
 RAW_EXTRA_CHAT_BODY = os.environ.get("OPENCLAW_RL_UI_EXTRA_CHAT_BODY_JSON", "").strip()
 try:
     EXTRA_CHAT_BODY = json.loads(RAW_EXTRA_CHAT_BODY) if RAW_EXTRA_CHAT_BODY else {}
@@ -92,12 +96,28 @@ class ProfileSelectRequest(BaseModel):
     profile_id: str = ""
 
 
+class SessionSelectRequest(BaseModel):
+    session_id: str = ""
+
+
 def _profile_dir(profile_id: str) -> Path:
     return PROFILES_DIR / profile_id
 
 
 def _profile_guidance_file(profile_id: str) -> Path:
     return _profile_dir(profile_id) / "steering_notes.txt"
+
+
+def _profile_sessions_dir(profile_id: str) -> Path:
+    return _profile_dir(profile_id) / "sessions"
+
+
+def _profile_active_session_file(profile_id: str) -> Path:
+    return _profile_dir(profile_id) / "active_session.txt"
+
+
+def _session_file(profile_id: str, session_id: str) -> Path:
+    return _profile_sessions_dir(profile_id) / f"{session_id}.json"
 
 
 def _ensure_profile_storage() -> None:
@@ -141,17 +161,203 @@ def _save_guidance_text(profile_id: str, text: str) -> str:
     return clean_text
 
 
-def _new_browser_state(profile_id: str | None = None) -> dict[str, Any]:
-    active_profile_id = profile_id or _load_active_profile_id()
+def _session_title_from_prompt(prompt: str) -> str:
+    clean = re.sub(r"\s+", " ", prompt).strip()
+    if not clean:
+        return DEFAULT_SESSION_TITLE
+    words = clean.split(" ")
+    title = " ".join(words[:SESSION_TITLE_WORDS]).strip()
+    if len(words) > SESSION_TITLE_WORDS or len(clean) > len(title):
+        title = f"{title}..."
+    title = title[:SESSION_TITLE_MAX_CHARS].rstrip()
+    return title or DEFAULT_SESSION_TITLE
+
+
+def _default_session_record(
+    *,
+    session_id: str | None = None,
+    title: str = DEFAULT_SESSION_TITLE,
+    created_at: float | None = None,
+) -> dict[str, Any]:
+    timestamp = float(created_at or time.time())
     return {
+        "id": session_id or uuid.uuid4().hex,
+        "title": title,
+        "created_at": timestamp,
+        "updated_at": timestamp,
         "transcript": [],
         "context_messages": [],
         "feedback_candidates": {},
+    }
+
+
+def _normalize_session_record(payload: dict[str, Any] | None, *, session_id: str | None = None) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return _default_session_record(session_id=session_id)
+
+    created_at = float(payload.get("created_at") or time.time())
+    updated_at = float(payload.get("updated_at") or created_at)
+    transcript = payload.get("transcript")
+    context_messages = payload.get("context_messages")
+    feedback_candidates = payload.get("feedback_candidates")
+    session = {
+        "id": str(payload.get("id") or session_id or uuid.uuid4().hex),
+        "title": str(payload.get("title") or DEFAULT_SESSION_TITLE).strip() or DEFAULT_SESSION_TITLE,
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "transcript": transcript if isinstance(transcript, list) else [],
+        "context_messages": context_messages if isinstance(context_messages, list) else [],
+        "feedback_candidates": feedback_candidates if isinstance(feedback_candidates, dict) else {},
+    }
+    return session
+
+
+def _load_session_record(profile_id: str, session_id: str) -> dict[str, Any]:
+    path = _session_file(profile_id, session_id)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        session = _default_session_record(session_id=session_id)
+        _save_session_record(profile_id, session)
+        return session
+    except json.JSONDecodeError:
+        session = _default_session_record(session_id=session_id)
+        _save_session_record(profile_id, session)
+        return session
+    return _normalize_session_record(payload, session_id=session_id)
+
+
+def _save_session_record(profile_id: str, session: dict[str, Any]) -> dict[str, Any]:
+    normalized = _normalize_session_record(session, session_id=str(session.get("id") or uuid.uuid4().hex))
+    normalized["updated_at"] = float(normalized.get("updated_at") or time.time())
+    sessions_dir = _profile_sessions_dir(profile_id)
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    _session_file(profile_id, normalized["id"]).write_text(
+        json.dumps(normalized, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return normalized
+
+
+def _session_summary(session: dict[str, Any]) -> dict[str, Any]:
+    transcript = session.get("transcript") or []
+    preview = ""
+    for item in transcript:
+        if item.get("role") == "assistant" and str(item.get("content") or "").strip():
+            preview = str(item.get("content") or "").strip()
+            break
+    if not preview:
+        for item in transcript:
+            if str(item.get("content") or "").strip():
+                preview = str(item.get("content") or "").strip()
+                break
+    preview = re.sub(r"\s+", " ", preview).strip()
+    return {
+        "id": str(session.get("id") or ""),
+        "title": str(session.get("title") or DEFAULT_SESSION_TITLE).strip() or DEFAULT_SESSION_TITLE,
+        "created_at": float(session.get("created_at") or time.time()),
+        "updated_at": float(session.get("updated_at") or time.time()),
+        "message_count": len(transcript),
+        "preview": preview[:120],
+    }
+
+
+def _list_profile_sessions(profile_id: str) -> list[dict[str, Any]]:
+    sessions_dir = _profile_sessions_dir(profile_id)
+    if not sessions_dir.exists():
+        return []
+
+    sessions: list[dict[str, Any]] = []
+    for path in sessions_dir.glob("*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            continue
+        sessions.append(_session_summary(_normalize_session_record(payload)))
+
+    sessions.sort(key=lambda item: (float(item.get("updated_at") or 0), float(item.get("created_at") or 0)), reverse=True)
+    return sessions
+
+
+def _load_profile_active_session_id(profile_id: str) -> str | None:
+    active_file = _profile_active_session_file(profile_id)
+    try:
+        session_id = active_file.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    return session_id or None
+
+
+def _save_profile_active_session_id(profile_id: str, session_id: str) -> str:
+    active_file = _profile_active_session_file(profile_id)
+    active_file.parent.mkdir(parents=True, exist_ok=True)
+    active_file.write_text(f"{session_id}\n", encoding="utf-8")
+    return session_id
+
+
+def _create_profile_session(profile_id: str, *, title: str = DEFAULT_SESSION_TITLE) -> dict[str, Any]:
+    session = _default_session_record(title=title)
+    saved = _save_session_record(profile_id, session)
+    _save_profile_active_session_id(profile_id, saved["id"])
+    return saved
+
+
+def _ensure_profile_active_session(profile_id: str) -> dict[str, Any]:
+    _ensure_profile_storage()
+    _profile_dir(profile_id).mkdir(parents=True, exist_ok=True)
+    _profile_sessions_dir(profile_id).mkdir(parents=True, exist_ok=True)
+
+    active_session_id = _load_profile_active_session_id(profile_id)
+    if active_session_id:
+        session_path = _session_file(profile_id, active_session_id)
+        if session_path.exists():
+            return _load_session_record(profile_id, active_session_id)
+
+    sessions = _list_profile_sessions(profile_id)
+    if sessions:
+        first_session_id = str(sessions[0]["id"])
+        _save_profile_active_session_id(profile_id, first_session_id)
+        return _load_session_record(profile_id, first_session_id)
+
+    return _create_profile_session(profile_id)
+
+
+def _load_state_from_session(state: dict[str, Any], profile_id: str, session_id: str | None = None) -> dict[str, Any]:
+    _ensure_profile_storage()
+    profile_id = profile_id or DEFAULT_PROFILE_ID
+
+    if session_id:
+        session = _load_session_record(profile_id, session_id)
+        _save_profile_active_session_id(profile_id, session["id"])
+    else:
+        session = _ensure_profile_active_session(profile_id)
+
+    state["active_profile_id"] = profile_id
+    state["guidance_text"] = _load_guidance_text(profile_id)
+    state["active_session_id"] = session["id"]
+    state["sessions"] = _list_profile_sessions(profile_id)
+    state["transcript"] = list(session.get("transcript") or [])
+    state["context_messages"] = list(session.get("context_messages") or [])
+    state["feedback_candidates"] = dict(session.get("feedback_candidates") or {})
+    state["busy"] = False
+    _touch_state(state)
+    return session
+
+
+def _new_browser_state(profile_id: str | None = None) -> dict[str, Any]:
+    state = {
+        "transcript": [],
+        "context_messages": [],
+        "feedback_candidates": {},
+        "sessions": [],
+        "active_session_id": "",
         "busy": False,
-        "guidance_text": _load_guidance_text(active_profile_id),
-        "active_profile_id": active_profile_id,
+        "guidance_text": "",
+        "active_profile_id": profile_id or _load_active_profile_id(),
         "updated_at": time.time(),
     }
+    _load_state_from_session(state, state["active_profile_id"])
+    return state
 
 
 def _serialize_state(state: dict[str, Any]) -> dict[str, Any]:
@@ -169,6 +375,8 @@ def _serialize_state(state: dict[str, Any]) -> dict[str, Any]:
         "guidance_text": state.get("guidance_text", ""),
         "active_profile_id": state.get("active_profile_id", DEFAULT_PROFILE_ID),
         "profiles_supported": PROFILES_SUPPORTED,
+        "sessions": state.get("sessions", []),
+        "active_session_id": state.get("active_session_id", ""),
     }
 
 
@@ -176,15 +384,43 @@ def _touch_state(state: dict[str, Any]) -> None:
     state["updated_at"] = time.time()
 
 
-def _set_state_profile(state: dict[str, Any], profile_id: str, *, reset_session: bool) -> None:
-    state["active_profile_id"] = profile_id
-    state["guidance_text"] = _load_guidance_text(profile_id)
-    if reset_session:
-        state["transcript"] = []
-        state["context_messages"] = []
-        state["feedback_candidates"] = {}
-        state["busy"] = False
+def _persist_active_session_state(state: dict[str, Any], *, title_from_prompt: str | None = None) -> None:
+    profile_id = str(state.get("active_profile_id") or DEFAULT_PROFILE_ID)
+    session_id = str(state.get("active_session_id") or "").strip()
+    if not session_id:
+        session = _ensure_profile_active_session(profile_id)
+        session_id = session["id"]
+        state["active_session_id"] = session_id
+
+    session = _load_session_record(profile_id, session_id)
+    had_user_messages = any(item.get("role") == "user" for item in session.get("transcript") or [])
+    session["transcript"] = list(state.get("transcript") or [])
+    session["context_messages"] = list(state.get("context_messages") or [])
+    session["feedback_candidates"] = dict(state.get("feedback_candidates") or {})
+    session["updated_at"] = time.time()
+    if title_from_prompt and not had_user_messages:
+        session["title"] = _session_title_from_prompt(title_from_prompt)
+    _save_session_record(profile_id, session)
+    _save_profile_active_session_id(profile_id, session_id)
+    state["sessions"] = _list_profile_sessions(profile_id)
     _touch_state(state)
+
+
+def _create_and_activate_session(state: dict[str, Any]) -> dict[str, Any]:
+    profile_id = str(state.get("active_profile_id") or DEFAULT_PROFILE_ID)
+    session = _create_profile_session(profile_id)
+    _load_state_from_session(state, profile_id, session["id"])
+    return session
+
+
+def _set_state_profile(state: dict[str, Any], profile_id: str) -> None:
+    _save_active_profile_id(profile_id)
+    _load_state_from_session(state, profile_id)
+
+
+def _select_state_session(state: dict[str, Any], session_id: str) -> None:
+    profile_id = str(state.get("active_profile_id") or DEFAULT_PROFILE_ID)
+    _load_state_from_session(state, profile_id, session_id)
 
 
 def _ensure_browser_session(request: Request) -> tuple[str, dict[str, Any], bool]:
@@ -342,7 +578,8 @@ def _commit_chat_turn(
 ) -> None:
     state["transcript"].extend([user_turn, assistant_turn])
     state["context_messages"] = _trim_context(
-        state["context_messages"] + [
+        state["context_messages"]
+        + [
             {"role": "user", "content": prompt},
             {"role": "assistant", "content": assistant_text},
         ]
@@ -354,6 +591,7 @@ def _commit_chat_turn(
         "guidance_text": guidance_text,
         "assistant_message": {"role": "assistant", "content": assistant_text},
     }
+    _persist_active_session_state(state, title_from_prompt=prompt)
 
 
 async def _proxy_chat(
@@ -386,30 +624,30 @@ async def _proxy_chat(
                 await _restart_backend_if_needed()
                 raise HTTPException(
                     status_code=503,
-                    detail="The RL backend disconnected and is being restarted. Wait about 30 seconds, then try again.",
+                    detail="The training backend disconnected and is being restarted. Wait about 30 seconds, then try again.",
                 ) from exc
-            raise HTTPException(status_code=502, detail=f"RL proxy connection error: {detail}") from exc
+            raise HTTPException(status_code=502, detail=f"Training backend connection error: {detail}") from exc
         if response.status_code != 200:
             detail = response.text[:1200]
             if response.status_code >= 500 and _should_restart_backend(detail):
                 await _restart_backend_if_needed()
                 raise HTTPException(
                     status_code=503,
-                    detail="The RL backend worker crashed and is being restarted. Wait about 30 seconds, then try again.",
+                    detail="The training backend worker crashed and is being restarted. Wait about 30 seconds, then try again.",
                 )
-            raise HTTPException(status_code=502, detail=f"RL proxy error {response.status_code}: {detail}")
+            raise HTTPException(status_code=502, detail=f"Training backend error {response.status_code}: {detail}")
         try:
             payload = response.json()
         except ValueError as exc:
-            raise HTTPException(status_code=502, detail="RL proxy returned invalid JSON") from exc
+            raise HTTPException(status_code=502, detail="Training backend returned invalid JSON") from exc
 
     if not isinstance(payload, dict):
-        raise HTTPException(status_code=502, detail="RL proxy returned an unexpected payload shape")
+        raise HTTPException(status_code=502, detail="Training backend returned an unexpected payload shape")
     if isinstance(payload.get("response"), dict):
         return payload["response"]
     if isinstance(payload.get("choices"), list):
         return payload
-    raise HTTPException(status_code=502, detail="RL proxy returned an unexpected payload shape")
+    raise HTTPException(status_code=502, detail="Training backend returned an unexpected payload shape")
 
 
 async def _proxy_chat_stream(
@@ -461,11 +699,22 @@ async def _proxy_chat_stream(
                     choice = choices[0]
                     delta = choice.get("delta") or {}
                     content = delta.get("content") or ""
-                    if content:
-                        yield {"type": "delta", "content": content, "payload": payload}
+                    metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
+                    if content or metrics:
+                        yield {
+                            "type": "delta",
+                            "content": content,
+                            "metrics": metrics,
+                            "payload": payload,
+                        }
                     finish_reason = choice.get("finish_reason")
                     if finish_reason is not None:
-                        yield {"type": "finish", "finish_reason": finish_reason, "payload": payload}
+                        yield {
+                            "type": "finish",
+                            "finish_reason": finish_reason,
+                            "metrics": metrics,
+                            "payload": payload,
+                        }
         except httpx.HTTPError as exc:
             detail = str(exc)
             if _should_restart_backend(detail):
@@ -716,8 +965,8 @@ async def api_profiles(request: Request) -> JSONResponse:
     _save_active_profile_id(active_profile_id)
     with _state_lock:
         state = _browser_sessions[browser_id]
-        current_profile_id = state.get("active_profile_id")
-        _set_state_profile(state, active_profile_id, reset_session=current_profile_id != active_profile_id and not state["busy"])
+        if not state["busy"]:
+            _set_state_profile(state, active_profile_id)
         payload = {
             "ok": True,
             "profiles": profile_payload.get("profiles") or [],
@@ -742,17 +991,16 @@ async def api_create_profile(request: Request, body: ProfileCreateRequest) -> JS
             raise HTTPException(status_code=409, detail="Another request is already running")
 
     profile_payload = await _proxy_create_profile(name)
-    created_profile_id = str(profile_payload.get("active_profile_id") or _load_active_profile_id())
+    created_profile_id = str(profile_payload.get("created_profile_id") or profile_payload.get("active_profile_id") or _load_active_profile_id())
     if body.select_after_create:
-        created_profile_id = str(profile_payload.get("created_profile_id") or created_profile_id)
         profile_payload = await _proxy_select_profile(created_profile_id)
 
-    active_profile_id = str(profile_payload.get("active_profile_id") or _load_active_profile_id())
+    active_profile_id = str(profile_payload.get("active_profile_id") or created_profile_id)
     _save_active_profile_id(active_profile_id)
 
     with _state_lock:
         state = _browser_sessions[browser_id]
-        _set_state_profile(state, active_profile_id, reset_session=True)
+        _set_state_profile(state, active_profile_id)
         payload = {
             "ok": True,
             "profiles": profile_payload.get("profiles") or [],
@@ -782,13 +1030,44 @@ async def api_select_profile(request: Request, body: ProfileSelectRequest) -> JS
 
     with _state_lock:
         state = _browser_sessions[browser_id]
-        _set_state_profile(state, active_profile_id, reset_session=True)
+        _set_state_profile(state, active_profile_id)
         payload = {
             "ok": True,
             "profiles": profile_payload.get("profiles") or [],
             "active_profile_id": active_profile_id,
             "state": _serialize_state(state),
         }
+    return _response_with_cookie(payload, browser_id, created)
+
+
+@app.post("/api/sessions")
+async def api_create_session(request: Request) -> JSONResponse:
+    browser_id, _, created = _ensure_browser_session(request)
+    with _state_lock:
+        state = _browser_sessions[browser_id]
+        if state["busy"]:
+            raise HTTPException(status_code=409, detail="Another request is already running")
+        _create_and_activate_session(state)
+        payload = {"ok": True, "state": _serialize_state(state)}
+    return _response_with_cookie(payload, browser_id, created)
+
+
+@app.post("/api/sessions/select")
+async def api_select_session(request: Request, body: SessionSelectRequest) -> JSONResponse:
+    session_id = body.session_id.strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id cannot be empty")
+
+    browser_id, _, created = _ensure_browser_session(request)
+    with _state_lock:
+        state = _browser_sessions[browser_id]
+        if state["busy"]:
+            raise HTTPException(status_code=409, detail="Another request is already running")
+        profile_id = str(state.get("active_profile_id") or DEFAULT_PROFILE_ID)
+        if not _session_file(profile_id, session_id).exists():
+            raise HTTPException(status_code=404, detail="Session not found for the active profile")
+        _select_state_session(state, session_id)
+        payload = {"ok": True, "state": _serialize_state(state)}
     return _response_with_cookie(payload, browser_id, created)
 
 
@@ -824,6 +1103,7 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
         "feedback_pending": False,
         "reasoning": "",
         "streaming": True,
+        "metrics": None,
     }
 
     prompt_messages: list[dict[str, Any]] = []
@@ -839,6 +1119,7 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
     async def event_stream():
         committed = False
         final_text = ""
+        last_metrics: dict[str, Any] | None = None
 
         try:
             yield _sse_event(
@@ -859,16 +1140,22 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
                 if await request.is_disconnected():
                     raise asyncio.CancelledError()
 
+                metrics = event.get("metrics") or {}
+                if metrics:
+                    last_metrics = metrics
+
                 if event["type"] == "delta":
                     delta = str(event.get("content") or "")
-                    if not delta:
+                    if delta:
+                        final_text += delta
+                    if not delta and not metrics:
                         continue
-                    final_text += delta
                     yield _sse_event(
                         "delta",
                         {
                             "assistant_turn_id": assistant_turn["id"],
                             "delta": delta,
+                            "metrics": metrics,
                         },
                     )
                     continue
@@ -879,6 +1166,7 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
                         {
                             "assistant_turn_id": assistant_turn["id"],
                             "finish_reason": event.get("finish_reason", "stop"),
+                            "metrics": metrics,
                         },
                     )
 
@@ -891,6 +1179,7 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
                 "content": assistant_text,
                 "feedback_pending": True,
                 "streaming": False,
+                "metrics": last_metrics,
             }
 
             with _state_lock:
@@ -910,12 +1199,7 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
                 serialized_state = _serialize_state(state)
 
             committed = True
-            yield _sse_event(
-                "state",
-                {
-                    "state": serialized_state,
-                },
-            )
+            yield _sse_event("state", {"state": serialized_state})
         except asyncio.CancelledError:
             with _state_lock:
                 state = _browser_sessions[browser_id]
@@ -965,7 +1249,7 @@ async def api_chat(request: Request, body: ChatRequest) -> JSONResponse:
         guidance_text = state.get("guidance_text", "")
 
     training_session_id = uuid.uuid4().hex
-    prompt_messages = []
+    prompt_messages: list[dict[str, Any]] = []
     chat_control_message = _chat_control_message()
     if chat_control_message is not None:
         prompt_messages.append(chat_control_message)
@@ -1003,6 +1287,7 @@ async def api_chat(request: Request, body: ChatRequest) -> JSONResponse:
             "feedback": None,
             "feedback_pending": True,
             "reasoning": (assistant_message.get("reasoning_content") or "").strip(),
+            "metrics": None,
         }
 
         with _state_lock:
@@ -1064,21 +1349,19 @@ async def api_feedback(request: Request, body: FeedbackRequest) -> JSONResponse:
 
     feedback_message = _feedback_text(score, body.note)
     clean_note = body.note.strip()
-    rating_label = body.rating
-    if rating_label not in {"good", "bad"}:
-        if score >= 7:
-            rating_label = "good"
-        elif score <= 4:
-            rating_label = "bad"
-        else:
-            rating_label = "neutral"
+    if score >= 7:
+        sentiment = "positive"
+    elif score <= 4:
+        sentiment = "negative"
+    else:
+        sentiment = "neutral"
 
     try:
         if BACKEND_MODE == "rl_proxy":
-            messages = (
-                list(pending_episode["prompt_messages"])
-                + [pending_episode["assistant_message"], {"role": "user", "content": feedback_message}]
-            )
+            messages = list(pending_episode["prompt_messages"]) + [
+                pending_episode["assistant_message"],
+                {"role": "user", "content": feedback_message},
+            ]
             await _proxy_chat(
                 messages=messages,
                 session_id=pending_episode["training_session_id"],
@@ -1100,7 +1383,7 @@ async def api_feedback(request: Request, body: FeedbackRequest) -> JSONResponse:
                     "created_at": time.time(),
                     "model": MODEL_NAME,
                     "score": score,
-                    "rating": rating_label,
+                    "sentiment": sentiment,
                     "note": clean_note,
                     "feedback_text": feedback_message,
                     "user_prompt": pending_episode.get("user_prompt", ""),
@@ -1113,10 +1396,10 @@ async def api_feedback(request: Request, body: FeedbackRequest) -> JSONResponse:
         with _state_lock:
             state = _browser_sessions[browser_id]
             for item in reversed(state["transcript"]):
-                if item["id"] == candidate_id:
+                if item.get("id") == candidate_id:
                     item["feedback"] = {
-                        "rating": rating_label,
                         "score": score,
+                        "sentiment": sentiment,
                         "note": clean_note,
                         "sent_text": feedback_message,
                         "created_at": time.time(),
@@ -1125,7 +1408,7 @@ async def api_feedback(request: Request, body: FeedbackRequest) -> JSONResponse:
                     break
             state.get("feedback_candidates", {}).pop(candidate_id, None)
             state["busy"] = False
-            _touch_state(state)
+            _persist_active_session_state(state)
             payload = {"ok": True, "state": _serialize_state(state)}
         return _response_with_cookie(payload, browser_id, created)
     except Exception:
@@ -1155,36 +1438,13 @@ async def api_guidance(request: Request, body: GuidanceRequest) -> JSONResponse:
 @app.post("/api/reset")
 async def api_reset(request: Request) -> JSONResponse:
     browser_id, _, created = _ensure_browser_session(request)
-
     with _state_lock:
         state = _browser_sessions[browser_id]
         if state["busy"]:
             raise HTTPException(status_code=409, detail="Another request is already running")
-        feedback_candidates = list((state.get("feedback_candidates") or {}).values())
-        state["busy"] = True
-
-    try:
-        if BACKEND_MODE == "rl_proxy":
-            for candidate in feedback_candidates:
-                await _proxy_chat(
-                    messages=[{"role": "user", "content": "Reset conversation."}],
-                    session_id=candidate["training_session_id"],
-                    turn_type="side",
-                    session_done=True,
-                    max_tokens=1,
-                )
-
-        with _state_lock:
-            _browser_sessions[browser_id] = _new_browser_state(_load_active_profile_id())
-            _touch_state(_browser_sessions[browser_id])
-            payload = {"ok": True, "state": _serialize_state(_browser_sessions[browser_id])}
-        return _response_with_cookie(payload, browser_id, created)
-    except Exception:
-        with _state_lock:
-            state = _browser_sessions[browser_id]
-            state["busy"] = False
-            _touch_state(state)
-        raise
+        _create_and_activate_session(state)
+        payload = {"ok": True, "state": _serialize_state(state)}
+    return _response_with_cookie(payload, browser_id, created)
 
 
 if __name__ == "__main__":

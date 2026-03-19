@@ -1,6 +1,7 @@
 const state = {
   transcript: [],
-  hasPendingFeedback: false,
+  sessions: [],
+  activeSessionId: "",
   busy: false,
   model: "",
   backendMode: "rl_proxy",
@@ -30,13 +31,14 @@ const els = {
   guidanceStatus: document.getElementById("guidance-status"),
   proxyStatus: document.getElementById("proxy-status"),
   modelLabel: document.getElementById("model-label"),
-  resetButton: document.getElementById("reset-button"),
+  newSessionButton: document.getElementById("new-session-button"),
+  sessionList: document.getElementById("session-list"),
+  sessionsEmpty: document.getElementById("sessions-empty"),
   desktopClock: document.getElementById("desktop-clock"),
   taskbarNetwork: document.getElementById("taskbar-network"),
   notesProfileLabel: document.getElementById("notes-profile-label"),
   settingsActiveProfile: document.getElementById("settings-active-profile"),
   chatActiveProfile: document.getElementById("chat-active-profile"),
-  chatSidebarProfile: document.getElementById("chat-sidebar-profile"),
   profileNameInput: document.getElementById("profile-name-input"),
   profileCreateButton: document.getElementById("profile-create-button"),
   profileCreateStatus: document.getElementById("profile-create-status"),
@@ -46,7 +48,6 @@ const els = {
   appWindows: Array.from(document.querySelectorAll("[data-window]")),
   taskbarApps: Array.from(document.querySelectorAll("[data-task-app]")),
   windowActions: Array.from(document.querySelectorAll("[data-window-action]")),
-  openAppButtons: Array.from(document.querySelectorAll("[data-open-app]")),
   messageTemplate: document.getElementById("message-template"),
 };
 
@@ -76,52 +77,13 @@ function renderMarkdownLite(text) {
   return blocks.join("");
 }
 
-function setBusy(isBusy) {
-  state.busy = isBusy;
-  renderControls();
-  renderTranscript();
-}
-
-function upsertStreamingTurn(turn) {
-  const existingIndex = state.transcript.findIndex((item) => item.id === turn.id);
-  if (existingIndex === -1) {
-    state.transcript = [...state.transcript, turn];
-    return;
-  }
-  const nextTranscript = [...state.transcript];
-  nextTranscript[existingIndex] = { ...nextTranscript[existingIndex], ...turn };
-  state.transcript = nextTranscript;
-}
-
-function appendStreamingDelta(turnId, delta) {
-  if (!delta) {
-    return;
-  }
-  const existingIndex = state.transcript.findIndex((item) => item.id === turnId);
-  if (existingIndex === -1) {
-    return;
-  }
-  const nextTranscript = [...state.transcript];
-  const current = nextTranscript[existingIndex];
-  nextTranscript[existingIndex] = {
-    ...current,
-    content: `${current.content || ""}${delta}`,
-    streaming: true,
-  };
-  state.transcript = nextTranscript;
-}
-
-function clearStreamingTurns() {
-  state.transcript = state.transcript.filter((item) => !item.streaming);
-}
-
 function getActiveProfile() {
   return state.profiles.find((profile) => profile.id === state.activeProfileId) || null;
 }
 
 function getFeedbackDraft(turnId) {
   if (!feedbackDrafts.has(turnId)) {
-    feedbackDrafts.set(turnId, { rating: "", note: "" });
+    feedbackDrafts.set(turnId, { score: null, note: "" });
   }
   return feedbackDrafts.get(turnId);
 }
@@ -130,34 +92,11 @@ function getFeedbackSummary(feedback) {
   if (!feedback) {
     return null;
   }
-
-  const explicitRating = feedback.rating;
   const score = Number(feedback.score ?? NaN);
-  let label = "Rated";
-  if (explicitRating === "good" || (!explicitRating && Number.isFinite(score) && score >= 7)) {
-    label = "Liked";
-  } else if (explicitRating === "bad" || (!explicitRating && Number.isFinite(score) && score <= 4)) {
-    label = "Disliked";
-  } else if (Number.isFinite(score)) {
-    label = `${score}/10`;
+  if (Number.isFinite(score)) {
+    return `${score}/10`;
   }
-
-  return {
-    label,
-    score,
-  };
-}
-
-function setGuidanceStatus(text) {
-  if (els.guidanceStatus) {
-    els.guidanceStatus.textContent = text;
-  }
-}
-
-function setProfileCreateStatus(text) {
-  if (els.profileCreateStatus) {
-    els.profileCreateStatus.textContent = text;
-  }
+  return "Rated";
 }
 
 function formatBytes(bytes) {
@@ -172,14 +111,101 @@ function formatBytes(bytes) {
   return `${scaled.toFixed(digits)} ${units[exponent]}`;
 }
 
+function formatSessionTime(timestamp) {
+  const value = Number(timestamp || 0);
+  if (!Number.isFinite(value) || value <= 0) {
+    return "";
+  }
+  const date = new Date(value * 1000);
+  const now = new Date();
+  const sameDay = date.toDateString() === now.toDateString();
+  if (sameDay) {
+    return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  }
+  return date.toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+function setGuidanceStatus(text) {
+  if (els.guidanceStatus) {
+    els.guidanceStatus.textContent = text;
+  }
+}
+
+function setProfileCreateStatus(text) {
+  if (els.profileCreateStatus) {
+    els.profileCreateStatus.textContent = text;
+  }
+}
+
+function autoResizeComposer() {
+  if (!els.promptInput) {
+    return;
+  }
+  els.promptInput.style.height = "auto";
+  const nextHeight = Math.min(Math.max(els.promptInput.scrollHeight, 24), 160);
+  els.promptInput.style.height = `${nextHeight}px`;
+}
+
+function setBusy(isBusy) {
+  state.busy = isBusy;
+  document.body.classList.toggle("busy", isBusy);
+  renderControls();
+  renderTranscript();
+  renderSessions();
+}
+
+function upsertStreamingTurn(turn) {
+  const existingIndex = state.transcript.findIndex((item) => item.id === turn.id);
+  if (existingIndex === -1) {
+    state.transcript = [...state.transcript, turn];
+    return;
+  }
+  const nextTranscript = [...state.transcript];
+  nextTranscript[existingIndex] = { ...nextTranscript[existingIndex], ...turn };
+  state.transcript = nextTranscript;
+}
+
+function appendStreamingDelta(turnId, delta, metrics = null) {
+  const existingIndex = state.transcript.findIndex((item) => item.id === turnId);
+  if (existingIndex === -1) {
+    return;
+  }
+  const nextTranscript = [...state.transcript];
+  const current = nextTranscript[existingIndex];
+  nextTranscript[existingIndex] = {
+    ...current,
+    content: `${current.content || ""}${delta || ""}`,
+    metrics: metrics || current.metrics || null,
+    streaming: true,
+  };
+  state.transcript = nextTranscript;
+}
+
+function setStreamingMetrics(turnId, metrics = null) {
+  if (!metrics) {
+    return;
+  }
+  const existingIndex = state.transcript.findIndex((item) => item.id === turnId);
+  if (existingIndex === -1) {
+    return;
+  }
+  const nextTranscript = [...state.transcript];
+  nextTranscript[existingIndex] = {
+    ...nextTranscript[existingIndex],
+    metrics,
+  };
+  state.transcript = nextTranscript;
+}
+
+function clearStreamingTurns() {
+  state.transcript = state.transcript.filter((item) => !item.ephemeral);
+}
+
 function updateProfileLabels() {
   const activeProfile = getActiveProfile();
   const profileLabel = activeProfile ? activeProfile.name : state.activeProfileId || "Default";
   if (els.chatActiveProfile) {
     els.chatActiveProfile.textContent = profileLabel;
-  }
-  if (els.chatSidebarProfile) {
-    els.chatSidebarProfile.textContent = profileLabel;
   }
   if (els.notesProfileLabel) {
     els.notesProfileLabel.textContent = activeProfile ? `Profile: ${profileLabel}` : "Profile";
@@ -243,12 +269,13 @@ function renderProfiles() {
 
     const footer = document.createElement("div");
     footer.className = "profile-footer";
+
     const hint = document.createElement("p");
-    hint.className = "hint";
+    hint.className = "profile-hint";
     hint.textContent =
       profile.id === state.activeProfileId
-        ? "Current notes and future live updates stay on this profile."
-        : "Switching loads this profile's saved notes and training state.";
+        ? "Current profile for chats, notes, and live updates."
+        : "Switch to this profile's chats, notes, and learned state.";
 
     const button = document.createElement("button");
     button.className = "profile-activate-button";
@@ -258,98 +285,71 @@ function renderProfiles() {
     button.addEventListener("click", () => {
       selectProfile(profile.id);
     });
-    footer.append(hint, button);
 
+    footer.append(hint, button);
     card.append(head, stats, footer);
-    els.profilesList.append(card);
+    els.profilesList.appendChild(card);
   }
 
   updateProfileLabels();
 }
 
-function updateDesktopClock() {
-  if (!els.desktopClock) {
+function renderSessions() {
+  if (!els.sessionList || !els.sessionsEmpty) {
     return;
   }
-  const now = new Date();
-  els.desktopClock.textContent = now.toLocaleTimeString([], {
-    hour: "numeric",
-    minute: "2-digit",
-  });
-}
 
-function getWindowByApp(appName) {
-  return els.appWindows.find((item) => item.dataset.window === appName) || null;
-}
+  els.sessionList.innerHTML = "";
+  const sessions = Array.isArray(state.sessions) ? state.sessions : [];
+  els.sessionsEmpty.classList.toggle("hidden", sessions.length > 0);
 
-function setDesktopSelection(appName) {
-  for (const launcher of els.appLaunchers) {
-    launcher.classList.toggle("active", launcher.dataset.appLaunch === appName);
-  }
-}
-
-function syncAppChrome() {
-  const anyOpen = Object.values(state.openApps).some(Boolean);
-  if (els.desktopShell) {
-    els.desktopShell.classList.toggle("app-open", anyOpen);
-  }
-
-  for (const appName of Object.keys(APP_DEFINITIONS)) {
-    const appWindow = getWindowByApp(appName);
-    if (appWindow) {
-      appWindow.classList.toggle("window-hidden", !state.openApps[appName]);
+  for (const session of sessions) {
+    const button = document.createElement("button");
+    button.className = "session-item";
+    button.type = "button";
+    if (session.id === state.activeSessionId) {
+      button.classList.add("active-session");
     }
-  }
+    button.disabled = state.busy && session.id !== state.activeSessionId;
+    button.addEventListener("click", () => {
+      selectSession(session.id);
+    });
 
-  for (const button of els.taskbarApps) {
-    const appName = button.dataset.taskApp;
-    const isActive = state.activeApp === appName;
-    const isOpen = Boolean(state.openApps[appName]);
-    button.classList.toggle("active", isActive);
-    button.classList.toggle("open-pill", isOpen && !isActive);
-    button.classList.toggle("inactive-pill", !isOpen);
-  }
-}
+    const titleRow = document.createElement("div");
+    titleRow.className = "session-item-head";
 
-function openApp(appName) {
-  const definition = APP_DEFINITIONS[appName];
-  if (!definition) {
-    return;
-  }
-  setDesktopSelection(appName);
-  if (!definition.hasWindow) {
-    window.alert(`${definition.label} is not installed yet. The desktop shell is ready for more apps later.`);
-    return;
-  }
-  for (const otherName of Object.keys(APP_DEFINITIONS)) {
-    state.openApps[otherName] = false;
-  }
-  state.openApps[appName] = true;
-  state.activeApp = appName;
-  syncAppChrome();
-}
+    const title = document.createElement("span");
+    title.className = "session-title";
+    title.textContent = session.title || "New chat";
 
-function closeApp(appName) {
-  if (!APP_DEFINITIONS[appName]) {
-    return;
+    const meta = document.createElement("span");
+    meta.className = "session-meta";
+    meta.textContent = formatSessionTime(session.updated_at);
+
+    titleRow.append(title, meta);
+
+    const preview = document.createElement("p");
+    preview.className = "session-preview";
+    preview.textContent = session.preview || "No messages yet.";
+
+    button.append(titleRow, preview);
+    els.sessionList.appendChild(button);
   }
-  state.openApps[appName] = false;
-  state.activeApp = "";
-  setDesktopSelection("");
-  syncAppChrome();
 }
 
 function renderStatus() {
   if (!els.proxyStatus) {
     return;
   }
-  els.proxyStatus.className = "status-chip";
+
   const backendLabel =
     state.backendMode === "rl_proxy"
       ? "Proxy"
       : state.backendMode === "trainer_api"
         ? "Trainer"
         : "Backend";
+
+  els.proxyStatus.className = "status-chip";
 
   if (state.proxyOk === null) {
     els.proxyStatus.textContent = `Checking ${backendLabel.toLowerCase()}...`;
@@ -381,7 +381,7 @@ function renderControls() {
   els.promptInput.disabled = disabled;
   els.guidanceInput.disabled = disabled;
   els.guidanceSaveButton.disabled = disabled;
-  els.resetButton.disabled = disabled;
+  els.newSessionButton.disabled = disabled;
   els.modelLabel.textContent = state.model || "Model";
 
   if (els.profileNameInput) {
@@ -392,12 +392,31 @@ function renderControls() {
   }
 
   updateProfileLabels();
+  autoResizeComposer();
+}
+
+function renderMessageMetrics(message, item) {
+  const metricsWrap = message.querySelector(".message-stream-stats");
+  const tokenCount = message.querySelector(".stream-token-count");
+  const speed = message.querySelector(".stream-speed");
+  const metrics = item.metrics && typeof item.metrics === "object" ? item.metrics : null;
+  const visibleTokens = Number(metrics?.visible_tokens ?? NaN);
+  const tokensPerSecond = Number(metrics?.tokens_per_second ?? NaN);
+  const shouldShow = item.streaming || (Number.isFinite(visibleTokens) && visibleTokens > 0);
+
+  metricsWrap.classList.toggle("hidden", !shouldShow);
+  if (!shouldShow) {
+    return;
+  }
+
+  tokenCount.textContent = Number.isFinite(visibleTokens) && visibleTokens > 0 ? `${visibleTokens} tok` : "";
+  speed.textContent = Number.isFinite(tokensPerSecond) && tokensPerSecond > 0 ? `${tokensPerSecond.toFixed(1)} tok/s` : "";
 }
 
 function renderTranscript() {
   els.transcript.innerHTML = "";
   const hasMessages = state.transcript.length > 0;
-  els.emptyState.style.display = hasMessages ? "none" : "grid";
+  els.emptyState.classList.toggle("hidden", hasMessages);
 
   for (const item of state.transcript) {
     const fragment = els.messageTemplate.content.cloneNode(true);
@@ -408,8 +427,8 @@ function renderTranscript() {
     const reasoningBlock = fragment.querySelector(".reasoning-block");
     const reasoningBody = fragment.querySelector(".reasoning-body");
     const feedbackControls = fragment.querySelector(".message-feedback-controls");
-    const feedbackGoodButton = fragment.querySelector('[data-feedback-choice="good"]');
-    const feedbackBadButton = fragment.querySelector('[data-feedback-choice="bad"]');
+    const scorePills = fragment.querySelector(".message-score-pills");
+    const scoreSummary = fragment.querySelector(".message-rating-summary");
     const feedbackInput = fragment.querySelector(".message-feedback-input");
     const feedbackSendButton = fragment.querySelector(".message-feedback-send");
     const feedbackSummary = fragment.querySelector(".message-feedback-summary");
@@ -421,54 +440,55 @@ function renderTranscript() {
     if (item.streaming) {
       message.classList.add("streaming-message");
     }
+
     roleLabel.textContent = item.role === "assistant" ? "Assistant" : "You";
-    body.innerHTML = renderMarkdownLite(item.content);
+    body.innerHTML = renderMarkdownLite(item.content || "");
 
     if (item.reasoning) {
       reasoningBlock.classList.remove("hidden");
       reasoningBody.textContent = item.reasoning;
     }
 
+    renderMessageMetrics(fragment, item);
+
     if (item.role !== "assistant") {
       feedbackControls.classList.add("hidden");
     } else if (item.streaming) {
       feedbackControls.classList.add("hidden");
       feedbackPill.classList.remove("hidden");
-      feedbackPill.textContent = "Streaming";
       feedbackPill.classList.add("neutral-pill");
+      feedbackPill.textContent = "Streaming";
     } else if (item.feedback) {
       const summary = getFeedbackSummary(item.feedback);
-      feedbackControls.classList.add("hidden");
       feedbackPill.classList.remove("hidden");
-      feedbackPill.textContent = summary?.label || "Rated";
-      feedbackPill.classList.add(
-        summary?.label === "Liked" ? "good-pill" : summary?.label === "Disliked" ? "bad-pill" : "neutral-pill"
-      );
-
+      feedbackPill.classList.add("good-pill");
+      feedbackPill.textContent = summary;
       feedbackSummary.classList.remove("hidden");
       feedbackSummary.textContent = item.feedback.note
-        ? `${summary?.label || "Rated"} for training. Note: ${item.feedback.note}`
-        : `${summary?.label || "Rated"} for training.`;
+        ? `Rated ${summary} for training. Note: ${item.feedback.note}`
+        : `Rated ${summary} for training.`;
     } else if (item.feedback_pending !== false) {
-      const draft = getFeedbackDraft(item.id);
       feedbackControls.classList.remove("hidden");
-      feedbackGoodButton.classList.toggle("selected", draft.rating === "good");
-      feedbackBadButton.classList.toggle("selected", draft.rating === "bad");
+      const draft = getFeedbackDraft(item.id);
+      scoreSummary.textContent = draft.score ? `Current score: ${draft.score}/10` : "Choose a score from 1 to 10";
       feedbackInput.value = draft.note;
       feedbackInput.disabled = state.busy;
-      feedbackSendButton.disabled = state.busy || !draft.rating;
+      feedbackSendButton.disabled = state.busy || !draft.score;
 
-      feedbackGoodButton.addEventListener("click", () => {
-        const nextDraft = getFeedbackDraft(item.id);
-        nextDraft.rating = nextDraft.rating === "good" ? "" : "good";
-        renderTranscript();
-      });
-
-      feedbackBadButton.addEventListener("click", () => {
-        const nextDraft = getFeedbackDraft(item.id);
-        nextDraft.rating = nextDraft.rating === "bad" ? "" : "bad";
-        renderTranscript();
-      });
+      for (let score = 1; score <= 10; score += 1) {
+        const button = document.createElement("button");
+        button.className = "score-pill";
+        button.type = "button";
+        button.textContent = String(score);
+        button.classList.toggle("selected", draft.score === score);
+        button.disabled = state.busy;
+        button.addEventListener("click", () => {
+          const nextDraft = getFeedbackDraft(item.id);
+          nextDraft.score = nextDraft.score === score ? null : score;
+          renderTranscript();
+        });
+        scorePills.appendChild(button);
+      }
 
       feedbackInput.addEventListener("input", (event) => {
         getFeedbackDraft(item.id).note = event.target.value;
@@ -501,12 +521,14 @@ function applyProfilesState(profilePayload) {
 
 function applyServerState(serverState, proxyState = null, profilePayload = null) {
   state.transcript = serverState.transcript || [];
-  state.hasPendingFeedback = Boolean(serverState.awaiting_feedback);
   state.busy = Boolean(serverState.busy);
+  document.body.classList.toggle("busy", state.busy);
   state.model = serverState.model || "";
   state.backendMode = serverState.backend_mode || "rl_proxy";
   state.proxyBaseUrl = serverState.proxy_base_url || "";
   state.activeProfileId = serverState.active_profile_id || state.activeProfileId || "";
+  state.activeSessionId = serverState.active_session_id || "";
+  state.sessions = Array.isArray(serverState.sessions) ? serverState.sessions : [];
   state.guidanceText = serverState.guidance_text || "";
 
   if (els.guidanceInput.value !== state.guidanceText) {
@@ -524,6 +546,7 @@ function applyServerState(serverState, proxyState = null, profilePayload = null)
   }
 
   renderTranscript();
+  renderSessions();
   renderControls();
   renderStatus();
   if (profilePayload) {
@@ -653,22 +676,29 @@ async function sendPrompt() {
     }
 
     els.promptInput.value = "";
+    autoResizeComposer();
     renderControls();
 
     await readSseStream(response, (eventName, payload) => {
       if (eventName === "start") {
         if (payload.user_turn) {
-          upsertStreamingTurn(payload.user_turn);
+          upsertStreamingTurn({ ...payload.user_turn, ephemeral: true });
         }
         if (payload.assistant_turn) {
-          upsertStreamingTurn(payload.assistant_turn);
+          upsertStreamingTurn({ ...payload.assistant_turn, ephemeral: true });
         }
         renderTranscript();
         return;
       }
 
       if (eventName === "delta") {
-        appendStreamingDelta(payload.assistant_turn_id, payload.delta || "");
+        appendStreamingDelta(payload.assistant_turn_id, payload.delta || "", payload.metrics || null);
+        renderTranscript();
+        return;
+      }
+
+      if (eventName === "final") {
+        setStreamingMetrics(payload.assistant_turn_id, payload.metrics || null);
         renderTranscript();
         return;
       }
@@ -691,8 +721,8 @@ async function sendPrompt() {
   } catch (error) {
     try {
       await refreshState();
-    } catch (refreshError) {
-      // Keep the original error if refresh also fails.
+    } catch (_refreshError) {
+      // Keep original error.
     }
     window.alert(error.message);
     setBusy(false);
@@ -705,7 +735,7 @@ async function sendFeedback(assistantTurnId) {
   }
 
   const draft = getFeedbackDraft(assistantTurnId);
-  if (!draft.rating) {
+  if (!draft.score) {
     return;
   }
 
@@ -715,8 +745,7 @@ async function sendFeedback(assistantTurnId) {
       method: "POST",
       body: JSON.stringify({
         assistant_turn_id: assistantTurnId,
-        rating: draft.rating,
-        score: draft.rating === "good" ? 9 : 2,
+        score: draft.score,
         note: draft.note.trim(),
       }),
     });
@@ -753,13 +782,6 @@ async function selectProfile(profileId) {
     return;
   }
 
-  if (state.transcript.length > 0) {
-    const shouldSwitch = window.confirm("Switch profiles and start a fresh local chat session?");
-    if (!shouldSwitch) {
-      return;
-    }
-  }
-
   setBusy(true);
   setProfileCreateStatus("Switching profile...");
   try {
@@ -768,6 +790,7 @@ async function selectProfile(profileId) {
       body: JSON.stringify({ profile_id: profileId }),
     });
     els.promptInput.value = "";
+    autoResizeComposer();
     feedbackDrafts.clear();
     applyServerState(payload.state, { ok: state.proxyOk !== false }, payload);
     setGuidanceStatus(
@@ -802,6 +825,7 @@ async function createProfile() {
     });
     els.profileNameInput.value = "";
     els.promptInput.value = "";
+    autoResizeComposer();
     feedbackDrafts.clear();
     applyServerState(payload.state, { ok: state.proxyOk !== false }, payload);
     setGuidanceStatus(
@@ -817,35 +841,133 @@ async function createProfile() {
   }
 }
 
-async function resetChat() {
-  const shouldReset = window.confirm("Reset the visible transcript and start a fresh chat?");
-  if (!shouldReset) {
+async function createSession() {
+  if (state.busy) {
     return;
   }
-
   setBusy(true);
   try {
-    const payload = await fetchJson("/api/reset", { method: "POST", body: "{}" });
+    const payload = await fetchJson("/api/sessions", {
+      method: "POST",
+      body: "{}",
+    });
     els.promptInput.value = "";
+    autoResizeComposer();
     feedbackDrafts.clear();
-    applyServerState(payload.state, { ok: true });
+    applyServerState(payload.state, { ok: state.proxyOk !== false });
   } catch (error) {
     window.alert(error.message);
     setBusy(false);
   }
 }
 
+async function selectSession(sessionId) {
+  if (!sessionId || sessionId === state.activeSessionId || state.busy) {
+    return;
+  }
+
+  setBusy(true);
+  try {
+    const payload = await fetchJson("/api/sessions/select", {
+      method: "POST",
+      body: JSON.stringify({ session_id: sessionId }),
+    });
+    els.promptInput.value = "";
+    autoResizeComposer();
+    feedbackDrafts.clear();
+    applyServerState(payload.state, { ok: state.proxyOk !== false });
+  } catch (error) {
+    window.alert(error.message);
+    setBusy(false);
+  }
+}
+
+function updateDesktopClock() {
+  if (!els.desktopClock) {
+    return;
+  }
+  const now = new Date();
+  els.desktopClock.textContent = now.toLocaleTimeString([], {
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+function getWindowByApp(appName) {
+  return els.appWindows.find((item) => item.dataset.window === appName) || null;
+}
+
+function setDesktopSelection(appName) {
+  for (const launcher of els.appLaunchers) {
+    launcher.classList.toggle("active", launcher.dataset.appLaunch === appName);
+  }
+}
+
+function syncAppChrome() {
+  const anyOpen = Object.values(state.openApps).some(Boolean);
+  if (els.desktopShell) {
+    els.desktopShell.classList.toggle("app-open", anyOpen);
+  }
+
+  for (const appName of Object.keys(APP_DEFINITIONS)) {
+    const appWindow = getWindowByApp(appName);
+    if (appWindow) {
+      appWindow.classList.toggle("window-hidden", !state.openApps[appName]);
+    }
+  }
+
+  for (const button of els.taskbarApps) {
+    const appName = button.dataset.taskApp;
+    const isActive = state.activeApp === appName;
+    const isOpen = Boolean(state.openApps[appName]);
+    button.classList.toggle("active", isActive);
+    button.classList.toggle("open-pill", isOpen && !isActive);
+    button.classList.toggle("inactive-pill", !isOpen);
+  }
+}
+
+function openApp(appName) {
+  const definition = APP_DEFINITIONS[appName];
+  if (!definition) {
+    return;
+  }
+  setDesktopSelection(appName);
+  if (!definition.hasWindow) {
+    window.alert(`${definition.label} is not installed yet. The desktop shell is ready for more apps later.`);
+    return;
+  }
+  for (const otherName of Object.keys(APP_DEFINITIONS)) {
+    state.openApps[otherName] = false;
+  }
+  state.openApps[appName] = true;
+  state.activeApp = appName;
+  syncAppChrome();
+}
+
+function closeApp(appName) {
+  if (!APP_DEFINITIONS[appName]) {
+    return;
+  }
+  state.openApps[appName] = false;
+  state.activeApp = "";
+  setDesktopSelection("");
+  syncAppChrome();
+}
+
 els.sendButton.addEventListener("click", sendPrompt);
 els.guidanceSaveButton.addEventListener("click", saveGuidance);
-els.resetButton.addEventListener("click", resetChat);
+els.newSessionButton.addEventListener("click", createSession);
 
 if (els.profileCreateButton) {
   els.profileCreateButton.addEventListener("click", createProfile);
 }
 
-els.promptInput.addEventListener("input", renderControls);
+els.promptInput.addEventListener("input", () => {
+  renderControls();
+});
+
 els.promptInput.addEventListener("keydown", (event) => {
-  if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+  if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
     sendPrompt();
   }
@@ -883,12 +1005,6 @@ for (const taskbarButton of els.taskbarApps) {
   });
 }
 
-for (const appButton of els.openAppButtons) {
-  appButton.addEventListener("click", () => {
-    openApp(appButton.dataset.openApp);
-  });
-}
-
 for (const actionButton of els.windowActions) {
   actionButton.addEventListener("click", () => {
     const targetWindow = actionButton.dataset.targetWindow;
@@ -905,6 +1021,7 @@ updateDesktopClock();
 window.setInterval(updateDesktopClock, 30000);
 syncAppChrome();
 setProfileCreateStatus("Create a new saved training profile.");
+autoResizeComposer();
 
 refreshState().catch((error) => {
   state.proxyOk = false;

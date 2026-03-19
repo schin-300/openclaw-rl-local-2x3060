@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>OpenClaw Local Feedback UI</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260319j" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260319l" />
   </head>
   <body>
     <div class="desktop-shell">
@@ -34,72 +34,61 @@
 
       <main class="desktop-stage" id="desktop-stage">
         <section class="app-window chat-window window-hidden" data-window="chat">
-          <header class="window-titlebar" data-window-titlebar="chat">
+          <header class="window-titlebar">
             <div class="window-brand">
               <div class="window-orb" aria-hidden="true"></div>
-              <div>
+              <div class="brand-copy">
                 <p class="eyebrow">AERO LOCAL OS</p>
                 <h1>OpenClaw Local Chat</h1>
               </div>
             </div>
             <div class="titlebar-meta">
-              <div class="status-chip" id="proxy-status">Checking proxy...</div>
-              <div class="model-label" id="model-label">Model</div>
-              <div class="model-label profile-pill" id="chat-active-profile">Default</div>
+              <div class="status-chip" id="proxy-status">Checking trainer...</div>
+              <div class="model-pill" id="model-label">Model</div>
+              <div class="model-pill profile-pill" id="chat-active-profile">Default</div>
               <div class="window-controls">
-                <button class="window-control close-control" data-window-action="close" data-target-window="chat" type="button" aria-label="Close local chat"></button>
+                <button
+                  class="window-control close-control"
+                  data-window-action="close"
+                  data-target-window="chat"
+                  type="button"
+                  aria-label="Close local chat"
+                ></button>
               </div>
             </div>
           </header>
 
-          <div class="window-grid">
-            <aside class="launcher-rail">
-              <section class="rail-panel">
-                <div class="chat-sidebar-head">
-                  <p class="rail-label">Workspace</p>
-                  <p class="sidebar-copy">Frutiger Aero desktop shell with a full local chat app.</p>
-                </div>
-                <button class="ghost-button launcher-button" id="reset-button" type="button">
-                  + New chat
-                </button>
-                <nav class="sidebar-links" aria-label="Workspace apps">
-                  <button class="ghost-button launcher-button sidebar-link" data-open-app="notes" type="button">
-                    notes.txt
-                  </button>
-                  <button class="ghost-button launcher-button sidebar-link" data-open-app="settings" type="button">
-                    settings.cpl
-                  </button>
-                </nav>
-                <div class="rail-footer">
-                  <p class="rail-footer-label">Active profile</p>
-                  <p class="rail-footer-value" id="chat-sidebar-profile">Default</p>
-                </div>
-              </section>
+          <div class="chat-layout">
+            <aside class="chat-sidebar">
+              <div class="sidebar-head">
+                <h2>Chats</h2>
+                <button class="new-chat-button" id="new-session-button" type="button">+ New chat</button>
+              </div>
+              <div class="session-list" id="session-list"></div>
+              <div class="sessions-empty hidden" id="sessions-empty">
+                Start a new chat to create the first saved conversation for this profile.
+              </div>
             </aside>
 
-            <section class="conversation-shell">
-              <section class="transcript-panel">
+            <section class="chat-main">
+              <section class="transcript-shell">
                 <div class="transcript" id="transcript"></div>
                 <div class="empty-state" id="empty-state">
-                  <h2>What should the local model learn next?</h2>
+                  <div class="empty-orb" aria-hidden="true"></div>
+                  <h2>Train the local model like a normal chat.</h2>
                   <p>
-                    Start a conversation the same way you would in ChatGPT. If an answer is worth training on,
-                    use the inline <strong>like</strong> or <strong>dislike</strong> controls under that assistant message and
-                    optionally leave a short note.
+                    Send messages naturally, let responses stream in live, then rate only the replies that are worth
+                    training on.
                   </p>
                 </div>
               </section>
 
               <section class="composer-shell">
-                <label class="composer-label" for="prompt-input">Message local-chat.exe</label>
-                <textarea
-                  id="prompt-input"
-                  rows="5"
-                  placeholder="Ask anything..."
-                ></textarea>
-                <div class="composer-actions">
-                  <p class="hint shortcut-tip">Press <code>Ctrl/Cmd + Enter</code> to send.</p>
-                  <button class="primary-button" id="send-button" type="button">Send prompt</button>
+                <div class="composer-frame">
+                  <textarea id="prompt-input" rows="1" placeholder="Ask anything..."></textarea>
+                  <button class="send-button" id="send-button" type="button" aria-label="Send message">
+                    <span class="send-button-icon" aria-hidden="true">&#10148;</span>
+                  </button>
                 </div>
               </section>
             </section>
@@ -107,76 +96,86 @@
         </section>
 
         <section class="app-window auxiliary-window window-hidden" data-window="notes">
-          <header class="window-titlebar" data-window-titlebar="notes">
+          <header class="window-titlebar">
             <div class="window-brand">
               <div class="window-orb notes-orb" aria-hidden="true"></div>
-              <div>
+              <div class="brand-copy">
                 <p class="eyebrow">LOCAL NOTES</p>
                 <h1>notes.txt</h1>
               </div>
             </div>
             <div class="titlebar-meta">
-              <div class="model-label" id="notes-profile-label">Profile</div>
+              <div class="model-pill" id="notes-profile-label">Profile</div>
               <div class="window-controls">
-                <button class="window-control close-control" data-window-action="close" data-target-window="notes" type="button" aria-label="Close notes"></button>
+                <button
+                  class="window-control close-control"
+                  data-window-action="close"
+                  data-target-window="notes"
+                  type="button"
+                  aria-label="Close notes"
+                ></button>
               </div>
             </div>
           </header>
           <div class="aux-window-body notes-body">
             <div class="notepad-sheet">
               <p class="notepad-caption">
-                Save steering notes, example scenarios, pitfalls, or behavior directions for the active profile.
+                Save steering notes, made-up example scenarios, or pitfalls to avoid for the active training profile.
               </p>
               <textarea
                 id="guidance-input"
                 rows="16"
-                placeholder="Example: If I ask for a refactor, keep behavior stable first. If a made-up scenario involves missing details, ask one precise clarifying question instead of guessing."
+                placeholder="Example: If I ask for a refactor, preserve behavior first. If a fictional scenario is underspecified, ask one sharp clarifying question instead of guessing."
               ></textarea>
               <div class="notepad-actions">
-                <p class="hint save-status" id="guidance-status">
-                  Saved notes will apply to future prompts.
-                </p>
-                <button class="primary-button" id="guidance-save-button" type="button">
-                  Save notes
-                </button>
+                <p class="save-status" id="guidance-status">Saved notes apply to future prompts.</p>
+                <button class="primary-button" id="guidance-save-button" type="button">Save notes</button>
               </div>
             </div>
           </div>
         </section>
 
         <section class="app-window auxiliary-window window-hidden" data-window="settings">
-          <header class="window-titlebar" data-window-titlebar="settings">
+          <header class="window-titlebar">
             <div class="window-brand">
               <div class="window-orb settings-orb" aria-hidden="true"></div>
-              <div>
+              <div class="brand-copy">
                 <p class="eyebrow">LOCAL SETTINGS</p>
                 <h1>Training Profiles</h1>
               </div>
             </div>
             <div class="titlebar-meta">
-              <div class="model-label" id="settings-active-profile">Profile</div>
+              <div class="model-pill" id="settings-active-profile">Profile</div>
               <div class="window-controls">
-                <button class="window-control close-control" data-window-action="close" data-target-window="settings" type="button" aria-label="Close settings"></button>
+                <button
+                  class="window-control close-control"
+                  data-window-action="close"
+                  data-target-window="settings"
+                  type="button"
+                  aria-label="Close settings"
+                ></button>
               </div>
             </div>
           </header>
+
           <div class="aux-window-body settings-body">
             <section class="settings-sidebar">
-              <p class="rail-label">Create profile</p>
-              <label class="composer-label" for="profile-name-input">New profile name</label>
+              <p class="settings-kicker">Create profile</p>
+              <label class="field-label" for="profile-name-input">New profile name</label>
               <input id="profile-name-input" type="text" placeholder="anime-girl / coding / roleplay" />
               <button class="primary-button full-width-button" id="profile-create-button" type="button">
                 Create and switch
               </button>
-              <p class="hint profile-create-status" id="profile-create-status">
-                Each profile keeps its own saved notes and training state.
+              <p class="profile-create-status" id="profile-create-status">
+                Each profile keeps its own chats, notes, and training state.
               </p>
             </section>
+
             <section class="settings-main">
               <div class="settings-head">
                 <div>
-                  <p class="card-eyebrow">Saved profiles</p>
-                  <h2>Switch local training profiles</h2>
+                  <p class="settings-kicker">Saved profiles</p>
+                  <h2>Switch training tracks</h2>
                 </div>
               </div>
               <div class="profiles-list" id="profiles-list"></div>
@@ -220,32 +219,31 @@
           <span class="feedback-pill hidden"></span>
         </div>
         <div class="message-body"></div>
+        <div class="message-stream-stats hidden">
+          <span class="stream-stat stream-token-count"></span>
+          <span class="stream-stat stream-speed"></span>
+        </div>
         <details class="reasoning-block hidden">
           <summary>Reasoning trace</summary>
           <pre class="reasoning-body"></pre>
         </details>
         <div class="message-feedback-controls hidden">
           <div class="message-feedback-toolbar">
-            <div class="message-feedback-choices" role="group" aria-label="Train on this reply">
-              <button class="feedback-choice" data-feedback-choice="good" type="button" aria-label="Like this response">
-                &#128077;
-              </button>
-              <button class="feedback-choice" data-feedback-choice="bad" type="button" aria-label="Dislike this response">
-                &#128078;
-              </button>
-            </div>
-            <span class="message-feedback-label">Optional training note</span>
+            <span class="message-feedback-label">Rate for training</span>
+            <span class="message-rating-summary">Choose a score from 1 to 10</span>
           </div>
+          <div class="message-score-pills" role="group" aria-label="Feedback score"></div>
           <div class="message-feedback-compose">
-            <textarea class="message-feedback-input" rows="2" placeholder="What should stick or change next time?"></textarea>
-            <button class="primary-button message-feedback-send" type="button">Send feedback</button>
+            <input class="message-feedback-input" type="text" placeholder="Optional training note" />
+            <button class="message-feedback-send" type="button" aria-label="Send training feedback">
+              <span aria-hidden="true">&#10148;</span>
+            </button>
           </div>
         </div>
         <div class="message-feedback-summary hidden"></div>
-        <div class="feedback-note hidden"></div>
       </article>
     </template>
 
-    <script src="/static/app.js?v=20260319j"></script>
+    <script src="/static/app.js?v=20260319l"></script>
   </body>
 </html>

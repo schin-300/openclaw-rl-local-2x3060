@@ -553,6 +553,18 @@ def _sse_data(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+def _stream_metrics(text: str, *, started_at: float) -> dict[str, Any]:
+    visible_tokens = 0
+    if text.strip():
+        visible_tokens = len(_tokenizer.encode(text, add_special_tokens=False))
+    elapsed = max(time.perf_counter() - started_at, 1e-3)
+    return {
+        "visible_tokens": visible_tokens,
+        "tokens_per_second": round(visible_tokens / elapsed, 2),
+        "elapsed_seconds": round(elapsed, 3),
+    }
+
+
 def _score_to_reward(score: int) -> float:
     return _EXPLICIT_FEEDBACK_REWARD_BY_SCORE.get(score, 0.0)
 
@@ -779,6 +791,7 @@ async def _stream_chat_completion(body: dict[str, Any]):
     top_p = float(body.get("top_p") if body.get("top_p") is not None else DEFAULT_TOP_P)
     response_id = f"chatcmpl-{uuid.uuid4().hex}"
     created_at = int(time.time())
+    started_at = time.perf_counter()
     stop_event = threading.Event()
     thread_error: dict[str, BaseException] = {}
 
@@ -840,6 +853,7 @@ async def _stream_chat_completion(body: dict[str, Any]):
                         "object": "chat.completion.chunk",
                         "created": created_at,
                         "model": SERVED_MODEL_NAME,
+                        "metrics": _stream_metrics(visible_text, started_at=started_at),
                         "choices": [{"index": 0, "delta": chunk_delta, "finish_reason": None}],
                     }
                 )
@@ -866,6 +880,7 @@ async def _stream_chat_completion(body: dict[str, Any]):
                         "object": "chat.completion.chunk",
                         "created": created_at,
                         "model": SERVED_MODEL_NAME,
+                        "metrics": _stream_metrics(visible_text, started_at=started_at),
                         "choices": [{"index": 0, "delta": chunk_delta, "finish_reason": None}],
                     }
                 )
@@ -879,6 +894,7 @@ async def _stream_chat_completion(body: dict[str, Any]):
                     "object": "chat.completion.chunk",
                     "created": created_at,
                     "model": SERVED_MODEL_NAME,
+                    "metrics": _stream_metrics(visible_text, started_at=started_at),
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                 }
             )

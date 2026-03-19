@@ -53,6 +53,113 @@ These are important enough to preserve across context resets:
 - The UI should show the size of each profile so growth from training / notes is visible.
 - The architecture should remain easy to extend with more desktop apps later.
 
+## Approved Chat UX Revision
+
+These requirements were explicitly confirmed after the first desktop-shell pass and should override older chat-layout decisions where they conflict.
+
+### Core direction
+
+- Keep the Frutiger Aero desktop home screen and double-click app launch.
+- Keep the Vista-style taskbar at the bottom.
+- Do **not** keep fake overlapping-window complexity inside the chat app.
+- `local-chat.exe` should behave like a real full app that fills the usable desktop above the taskbar.
+- The app may keep a slim Windows-app style title bar, but the rest of the screen should read primarily as chat.
+
+### Chat layout
+
+- The chat app should feel much closer to ChatGPT than to a dashboard.
+- The chat app should use a **two-column layout**:
+  - a left sidebar for conversations
+  - a main conversation surface for the transcript and composer
+- The left sidebar should contain:
+  - a `Chats` heading
+  - a `New chat` action at the top right of the sidebar header
+  - a scrollable list of saved sessions
+- Remove `notes.txt` and `settings.cpl` from the chat sidebar.
+- Remove the active-profile section from the chat sidebar.
+- `notes.txt` and `settings.cpl` should remain available as separate desktop/taskbar apps.
+
+### Sessions
+
+- Sessions must persist across refreshes and service restarts.
+- Sessions must be linked to the currently selected training profile.
+- Each profile should maintain its own independent chat/session list.
+- Session titles should be generated from the first user prompt, using the first few words only.
+- Do not add LLM-based conversation title generation.
+- The session list must be scrollable.
+- Selecting a different session should restore its transcript and pending feedback state.
+
+### Composer
+
+- The composer should be visually compact by default, closer to ChatGPT or iMessage than the current large panel.
+- The composer should take up roughly `10%` of screen height or less in the normal idle state.
+- The input should start as a small single-line control.
+- The input should auto-grow vertically as the user adds more lines.
+- Pressing `Enter` should send the message.
+- Pressing `Shift+Enter` should create a new line.
+- Remove the helper text that says `Ctrl/Cmd + Enter` to send.
+- Replace the current large CTA with a compact real send button.
+
+### Feedback / training controls
+
+- Feedback should stay inline under assistant messages.
+- Do not require feedback before the next prompt can be sent.
+- Unrated replies should not create training data.
+- Use a **single 1-10 rating system** instead of separate thumbs-up / thumbs-down controls.
+- Each assistant message can include:
+  - a compact 1-10 rating control
+  - a small optional note field
+  - a compact send/apply feedback action
+- The feedback UI should stay lighter and less boxy than the current dashboard-like controls.
+
+### Streaming telemetry
+
+- Show `tok/s` for the currently streaming assistant response.
+- Place the stream speed on or directly under the active assistant bubble.
+- If practical, update the `tok/s` display live during generation instead of only after completion.
+
+### Verification target
+
+- Prioritize correct behavior at `1920x1080`.
+- A fixed, polished `1920x1080` build is more important than generalized resize behavior for now.
+
+## Future Experimental Branch
+
+After the approved mainline plan above is complete and stable, a separate experimental branch should be created for a much stronger ChatGPT-parity pass.
+
+### Branching rule
+
+- Do not overwrite the known-good mainline build when starting the parity experiment.
+- Create a dedicated experimental git branch from the verified mainline state first.
+- Keep the verified mainline state easily reversible in git before the parity pass begins.
+
+### Goal
+
+- Redesign the UI to look **much closer to ChatGPT itself**, not just “ChatGPT-like inside Frutiger Aero”.
+- Use the real ChatGPT web UI as the comparison target.
+- Validate similarity using Playwright interactive, not by intuition alone.
+
+### Required process
+
+- Define explicit, reusable similarity metrics before judging the result.
+- Use those same metrics as the north star during the entire experimental pass.
+- Compare the live experimental app side-by-side with ChatGPT.
+- Assign a numeric similarity score out of `10`.
+- The target similarity score is at least `9/10`.
+
+### Example metric categories
+
+- overall page structure
+- sidebar width and hierarchy
+- top bar proportions
+- transcript column width and alignment
+- message spacing and grouping
+- composer size, placement, and controls
+- typography scale and weight
+- surface contrast and background behavior
+- icon/button placement and density
+- scroll behavior and empty-state composition
+
 ## Streaming Design
 
 This section captures the planned approach for adding **real streaming** to the current Qwen3.5 local stack before implementation work starts.
