@@ -40,10 +40,13 @@ This fork packages a practical single-machine setup for running OpenClaw-RL on *
 ### What This Fork Adds
 
 - A working **2-GPU local LoRA training path** for `Qwen3-0.6B`
-- A simple browser-based **feedback UI** at `http://127.0.0.1:30001`
+- An experimental **Qwen3-4B** local RL path tuned for this box
+- A separate experimental **Qwen3.5-4B 4-bit** live-training path with a persistent LoRA adapter
+- Browser-based **feedback UIs** at `http://127.0.0.1:30001`, `http://127.0.0.1:30003`, and `http://127.0.0.1:30005`
 - **1-10 explicit reward scoring** instead of only binary good/bad feedback
 - A persistent **steering notes and scenarios** panel that injects standing guidance into future prompts
 - A host-ready **systemd user-service workflow** for keeping the local trainer and UI running
+- A one-command stack switcher at [`switch-local-stack.sh`](./switch-local-stack.sh)
 
 ### Current Local Flow
 
@@ -51,13 +54,26 @@ This fork packages a practical single-machine setup for running OpenClaw-RL on *
 2. Chat with the model in the feedback UI.
 3. Rate each answer from `1` to `10` and optionally leave a note.
 4. Save longer-lived preferences, pitfalls, and made-up example scenarios in the steering panel.
-5. Let the local trainer update the live LoRA adapter after each rated rollout batch.
+5. Let the local trainer update the live LoRA adapter after each rated turn and save the adapter state back to disk.
 
 ### Important Notes
 
 - This repo intentionally **does not include downloaded model weights, checkpoints, or runtime state**.
-- The current consumer-GPU path is tuned for `Qwen3-0.6B`; larger models need a fresh memory-fit pass.
-- Upstream `Qwen3.5` support is **not wired in yet** in this fork.
+- `Qwen3-0.6B` is the stable live-training baseline on this machine.
+- `Qwen3-4B` is an experimental live-training path and still needs more runtime hardening.
+- `Qwen3.5-4B` now runs as a separate reward-weighted local training stack with persistent LoRA checkpoints.
+- The `Qwen3.5-4B` path is experimental and independent from the slime-based trainer.
+- Only one of the local model stacks should be active at a time on 2x3060 hardware.
+
+### Switching Local Stacks
+
+```bash
+cd /home/main/OpenClaw-RL
+./switch-local-stack.sh qwen3
+./switch-local-stack.sh qwen3-4b
+./switch-local-stack.sh qwen35
+./switch-local-stack.sh status
+```
 
 
 
@@ -582,5 +598,3 @@ When using OpenClaw-RL, please do not provide sensitive personal information dur
 
 
 ---
-
-

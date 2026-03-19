@@ -3,6 +3,7 @@ const state = {
   awaitingFeedback: false,
   busy: false,
   model: "",
+  backendMode: "rl_proxy",
   proxyBaseUrl: "",
   proxyOk: null,
   guidanceText: "",
@@ -23,6 +24,10 @@ const els = {
   guidanceStatus: document.getElementById("guidance-status"),
   proxyStatus: document.getElementById("proxy-status"),
   modelLabel: document.getElementById("model-label"),
+  subcopy: document.getElementById("subcopy"),
+  modeBanner: document.getElementById("mode-banner"),
+  feedbackHint: document.getElementById("feedback-hint"),
+  howItWorksText: document.getElementById("how-it-works-text"),
   resetButton: document.getElementById("reset-button"),
   messageTemplate: document.getElementById("message-template"),
 };
@@ -118,18 +123,48 @@ function renderControls() {
   updateFeedbackScoreLabel();
 }
 
+function renderMode() {
+  const liveTrainingMode = state.backendMode === "rl_proxy" || state.backendMode === "trainer_api";
+  if (liveTrainingMode) {
+    els.subcopy.textContent =
+      "Each answer is held for a 1 to 10 rating, plus an optional note. Those ratings and comments become live reward signals for the local trainer.";
+    els.feedbackHint.textContent =
+      "Feedback closes the current training episode cleanly, then the next prompt starts a fresh one while keeping this visible transcript as context.";
+    if (state.backendMode === "rl_proxy") {
+      els.howItWorksText.innerHTML =
+        `The UI talks directly to your local RL proxy on <code>${escapeHtml(state.proxyBaseUrl || "port 30000")}</code>. Your numeric score and note are sent back as explicit feedback, so the trainer does not have to guess whether the last answer was good or bad.`;
+    } else {
+      els.howItWorksText.innerHTML =
+        `The UI talks directly to your local reward-weighted trainer on <code>${escapeHtml(state.proxyBaseUrl || "the configured backend port")}</code>. Each score updates the active LoRA adapter live, then the adapter checkpoint is saved back to disk.`;
+    }
+    els.modeBanner.textContent = "";
+    els.modeBanner.classList.add("hidden");
+    return;
+  }
+
+  els.subcopy.textContent =
+    "This backend gives you the same chat, rating, and steering workflow, but feedback is logged for later analysis rather than applied as a live RL weight update.";
+  els.feedbackHint.textContent =
+    "Feedback closes the current review cycle and unlocks the next prompt, but this experimental backend does not run a live training step after each rating.";
+  els.howItWorksText.innerHTML =
+    `The UI talks directly to your local experimental backend on <code>${escapeHtml(state.proxyBaseUrl || "the configured backend port")}</code>. Your numeric score and note are appended to a feedback log, but no live checkpoint or weight update is triggered in this mode.`;
+  els.modeBanner.textContent = "Experimental mode: ratings are logged only. No live RL or weight updates are running.";
+  els.modeBanner.classList.remove("hidden");
+}
+
 function renderStatus() {
   els.proxyStatus.className = "status-chip";
+  const backendLabel = state.backendMode === "rl_proxy" ? "Proxy" : state.backendMode === "trainer_api" ? "Trainer" : "Backend";
   if (state.proxyOk === null) {
-    els.proxyStatus.textContent = "Checking proxy...";
+    els.proxyStatus.textContent = `Checking ${backendLabel.toLowerCase()}...`;
     return;
   }
   if (state.proxyOk) {
-    els.proxyStatus.textContent = "Proxy connected";
+    els.proxyStatus.textContent = `${backendLabel} connected`;
     els.proxyStatus.classList.add("status-good");
     return;
   }
-  els.proxyStatus.textContent = "Proxy unavailable";
+  els.proxyStatus.textContent = `${backendLabel} unavailable`;
   els.proxyStatus.classList.add("status-bad");
 }
 
@@ -138,6 +173,7 @@ function applyServerState(serverState, proxyState = null) {
   state.awaitingFeedback = Boolean(serverState.awaiting_feedback);
   state.busy = Boolean(serverState.busy);
   state.model = serverState.model || "";
+  state.backendMode = serverState.backend_mode || "rl_proxy";
   state.proxyBaseUrl = serverState.proxy_base_url || "";
   state.guidanceText = serverState.guidance_text || "";
   if (els.guidanceInput.value !== state.guidanceText) {
@@ -153,6 +189,7 @@ function applyServerState(serverState, proxyState = null) {
   }
   renderTranscript();
   renderControls();
+  renderMode();
   renderStatus();
 }
 

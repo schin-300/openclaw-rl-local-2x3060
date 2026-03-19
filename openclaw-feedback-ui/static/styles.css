@@ -83,6 +83,17 @@ h1 {
   margin: 12px 0 0;
 }
 
+.mode-banner {
+  margin: 16px 0 0;
+  max-width: 760px;
+  padding: 12px 14px;
+  border: 1px solid rgba(255, 139, 125, 0.3);
+  border-radius: 14px;
+  background: rgba(255, 139, 125, 0.1);
+  color: #ffd3cc;
+  line-height: 1.55;
+}
+
 .status-panel {
   min-width: 260px;
   display: grid;

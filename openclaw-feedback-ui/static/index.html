@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>OpenClaw-RL Feedback UI</title>
+    <title>OpenClaw Local Feedback UI</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
@@ -11,12 +11,14 @@
     <div class="shell">
       <header class="topbar">
         <div>
-          <p class="eyebrow">LOCAL TRAINING CONSOLE</p>
-          <h1>OpenClaw-RL Feedback UI</h1>
-          <p class="subcopy">
+          <p class="eyebrow">LOCAL MODEL CONSOLE</p>
+          <h1>OpenClaw Local Feedback UI</h1>
+          <p class="subcopy" id="subcopy">
             Each answer is held for a 1 to 10 rating, plus an optional note. Those ratings and
-            comments become live reward signals for the local trainer.
+            comments can be routed into a live trainer or logged for later analysis, depending on
+            the active backend.
           </p>
+          <p class="mode-banner hidden" id="mode-banner"></p>
         </div>
         <div class="status-panel">
           <div class="status-chip" id="proxy-status">Checking proxy...</div>
@@ -67,7 +69,7 @@
 
           <section class="card pending-card" id="feedback-card">
             <h2>Rate the last answer</h2>
-            <p class="hint">
+            <p class="hint" id="feedback-hint">
               Feedback closes the current training episode cleanly, then the next prompt starts a
               fresh one while keeping this visible transcript as context.
             </p>
@@ -101,10 +103,10 @@
 
           <section class="card">
             <h2>How this works</h2>
-            <p class="hint">
-              The UI talks directly to your local RL proxy on port <code>30000</code>. Your
-              numeric score and note are sent back as explicit feedback, so the trainer does not
-              have to guess whether the last answer was good or bad.
+            <p class="hint" id="how-it-works-text">
+              The UI talks to a local model backend and captures explicit numeric feedback. In RL
+              mode that feedback is turned into live reward signals. In experimental chat mode it
+              is logged for later analysis without updating weights live.
             </p>
           </section>
         </aside>
