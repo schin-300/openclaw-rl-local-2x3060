@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>OpenClaw Local Feedback UI</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260319l" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260319m" />
   </head>
   <body>
     <div class="desktop-shell">
@@ -45,6 +45,9 @@
             <div class="titlebar-meta">
               <div class="status-chip" id="proxy-status">Checking trainer...</div>
               <div class="model-pill" id="model-label">Model</div>
+              <button class="thinking-toggle" id="thinking-toggle" type="button" aria-pressed="false">
+                Thinking off
+              </button>
               <div class="model-pill profile-pill" id="chat-active-profile">Default</div>
               <div class="window-controls">
                 <button
@@ -224,7 +227,7 @@
           <span class="stream-stat stream-speed"></span>
         </div>
         <details class="reasoning-block hidden">
-          <summary>Reasoning trace</summary>
+          <summary>Thinking</summary>
           <pre class="reasoning-body"></pre>
         </details>
         <div class="message-feedback-controls hidden">
@@ -244,6 +247,6 @@
       </article>
     </template>
 
-    <script src="/static/app.js?v=20260319l"></script>
+    <script src="/static/app.js?v=20260319m"></script>
   </body>
 </html>

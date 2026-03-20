@@ -8,6 +8,7 @@ const state = {
   proxyBaseUrl: "",
   proxyOk: null,
   guidanceText: "",
+  thinkingEnabled: false,
   activeProfileId: "",
   profiles: [],
   openApps: {
@@ -31,6 +32,7 @@ const els = {
   guidanceStatus: document.getElementById("guidance-status"),
   proxyStatus: document.getElementById("proxy-status"),
   modelLabel: document.getElementById("model-label"),
+  thinkingToggle: document.getElementById("thinking-toggle"),
   newSessionButton: document.getElementById("new-session-button"),
   sessionList: document.getElementById("session-list"),
   sessionsEmpty: document.getElementById("sessions-empty"),
@@ -165,7 +167,7 @@ function upsertStreamingTurn(turn) {
   state.transcript = nextTranscript;
 }
 
-function appendStreamingDelta(turnId, delta, metrics = null) {
+function appendStreamingDelta(turnId, delta, reasoningDelta = "", metrics = null) {
   const existingIndex = state.transcript.findIndex((item) => item.id === turnId);
   if (existingIndex === -1) {
     return;
@@ -175,6 +177,7 @@ function appendStreamingDelta(turnId, delta, metrics = null) {
   nextTranscript[existingIndex] = {
     ...current,
     content: `${current.content || ""}${delta || ""}`,
+    reasoning: `${current.reasoning || ""}${reasoningDelta || ""}`,
     metrics: metrics || current.metrics || null,
     streaming: true,
   };
@@ -383,6 +386,12 @@ function renderControls() {
   els.guidanceSaveButton.disabled = disabled;
   els.newSessionButton.disabled = disabled;
   els.modelLabel.textContent = state.model || "Model";
+  if (els.thinkingToggle) {
+    els.thinkingToggle.disabled = disabled;
+    els.thinkingToggle.classList.toggle("active", state.thinkingEnabled);
+    els.thinkingToggle.setAttribute("aria-pressed", state.thinkingEnabled ? "true" : "false");
+    els.thinkingToggle.textContent = state.thinkingEnabled ? "Thinking on" : "Thinking off";
+  }
 
   if (els.profileNameInput) {
     els.profileNameInput.disabled = disabled;
@@ -400,7 +409,7 @@ function renderMessageMetrics(message, item) {
   const tokenCount = message.querySelector(".stream-token-count");
   const speed = message.querySelector(".stream-speed");
   const metrics = item.metrics && typeof item.metrics === "object" ? item.metrics : null;
-  const visibleTokens = Number(metrics?.visible_tokens ?? NaN);
+  const visibleTokens = Number(metrics?.generated_tokens ?? metrics?.visible_tokens ?? NaN);
   const tokensPerSecond = Number(metrics?.tokens_per_second ?? NaN);
   const shouldShow = item.streaming || (Number.isFinite(visibleTokens) && visibleTokens > 0);
 
@@ -446,6 +455,7 @@ function renderTranscript() {
 
     if (item.reasoning) {
       reasoningBlock.classList.remove("hidden");
+      reasoningBlock.open = Boolean(item.streaming);
       reasoningBody.textContent = item.reasoning;
     }
 
@@ -530,6 +540,7 @@ function applyServerState(serverState, proxyState = null, profilePayload = null)
   state.activeSessionId = serverState.active_session_id || "";
   state.sessions = Array.isArray(serverState.sessions) ? serverState.sessions : [];
   state.guidanceText = serverState.guidance_text || "";
+  state.thinkingEnabled = Boolean(serverState.thinking_enabled);
 
   if (els.guidanceInput.value !== state.guidanceText) {
     els.guidanceInput.value = state.guidanceText;
@@ -666,7 +677,7 @@ async function sendPrompt() {
       method: "POST",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt }),
+      body: JSON.stringify({ prompt, thinking_enabled: state.thinkingEnabled }),
     });
 
     if (!response.ok) {
@@ -692,7 +703,12 @@ async function sendPrompt() {
       }
 
       if (eventName === "delta") {
-        appendStreamingDelta(payload.assistant_turn_id, payload.delta || "", payload.metrics || null);
+        appendStreamingDelta(
+          payload.assistant_turn_id,
+          payload.delta || "",
+          payload.reasoning_delta || "",
+          payload.metrics || null
+        );
         renderTranscript();
         return;
       }
@@ -861,6 +877,24 @@ async function createSession() {
   }
 }
 
+async function toggleThinking() {
+  if (state.busy || !els.thinkingToggle) {
+    return;
+  }
+
+  setBusy(true);
+  try {
+    const payload = await fetchJson("/api/thinking", {
+      method: "POST",
+      body: JSON.stringify({ enabled: !state.thinkingEnabled }),
+    });
+    applyServerState(payload.state, { ok: state.proxyOk !== false });
+  } catch (error) {
+    window.alert(error.message);
+    setBusy(false);
+  }
+}
+
 async function selectSession(sessionId) {
   if (!sessionId || sessionId === state.activeSessionId || state.busy) {
     return;
@@ -957,6 +991,9 @@ function closeApp(appName) {
 els.sendButton.addEventListener("click", sendPrompt);
 els.guidanceSaveButton.addEventListener("click", saveGuidance);
 els.newSessionButton.addEventListener("click", createSession);
+if (els.thinkingToggle) {
+  els.thinkingToggle.addEventListener("click", toggleThinking);
+}
 
 if (els.profileCreateButton) {
   els.profileCreateButton.addEventListener("click", createProfile);

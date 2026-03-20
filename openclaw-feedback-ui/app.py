@@ -25,6 +25,7 @@ STATE_DIR = Path(os.environ.get("OPENCLAW_RL_UI_STATE_DIR", APP_DIR / "state")).
 PROFILES_DIR = STATE_DIR / "profiles"
 LEGACY_GUIDANCE_FILE = STATE_DIR / "steering_notes.txt"
 ACTIVE_PROFILE_FILE = STATE_DIR / "active_profile.txt"
+LEGACY_THINKING_FILE = STATE_DIR / "thinking_enabled.txt"
 FEEDBACK_LOG_FILE_VALUE = os.environ.get("OPENCLAW_RL_UI_FEEDBACK_LOG_FILE", "").strip()
 FEEDBACK_LOG_FILE = Path(FEEDBACK_LOG_FILE_VALUE).expanduser() if FEEDBACK_LOG_FILE_VALUE else None
 
@@ -44,6 +45,9 @@ DEFAULT_PROFILE_ID = os.environ.get("OPENCLAW_RL_DEFAULT_PROFILE_ID", "default")
 REQUEST_TIMEOUT = float(os.environ.get("OPENCLAW_RL_UI_TIMEOUT_SECONDS", "600"))
 MAX_HISTORY_TURNS = int(os.environ.get("OPENCLAW_RL_UI_MAX_HISTORY_TURNS", "16"))
 UI_MAX_TOKENS = int(os.environ.get("OPENCLAW_RL_UI_MAX_TOKENS", "384"))
+UI_THINKING_MAX_TOKENS = int(
+    os.environ.get("OPENCLAW_RL_UI_THINKING_MAX_TOKENS", str(max(UI_MAX_TOKENS * 2, UI_MAX_TOKENS + 192)))
+)
 UI_HOST = os.environ.get("OPENCLAW_RL_UI_HOST", "127.0.0.1")
 UI_PORT = int(os.environ.get("OPENCLAW_RL_UI_PORT", "30001"))
 RL_SERVICE_NAME = os.environ.get("OPENCLAW_RL_SERVICE_NAME", "openclaw-rl.service")
@@ -74,6 +78,7 @@ _last_backend_restart_at = 0.0
 
 class ChatRequest(BaseModel):
     prompt: str
+    thinking_enabled: bool | None = None
 
 
 class FeedbackRequest(BaseModel):
@@ -100,12 +105,20 @@ class SessionSelectRequest(BaseModel):
     session_id: str = ""
 
 
+class ThinkingRequest(BaseModel):
+    enabled: bool = False
+
+
 def _profile_dir(profile_id: str) -> Path:
     return PROFILES_DIR / profile_id
 
 
 def _profile_guidance_file(profile_id: str) -> Path:
     return _profile_dir(profile_id) / "steering_notes.txt"
+
+
+def _profile_thinking_file(profile_id: str) -> Path:
+    return _profile_dir(profile_id) / "thinking_enabled.txt"
 
 
 def _profile_sessions_dir(profile_id: str) -> Path:
@@ -127,6 +140,10 @@ def _ensure_profile_storage() -> None:
     if LEGACY_GUIDANCE_FILE.exists() and not default_guidance_path.exists():
         default_guidance_path.parent.mkdir(parents=True, exist_ok=True)
         default_guidance_path.write_text(LEGACY_GUIDANCE_FILE.read_text(encoding="utf-8"), encoding="utf-8")
+    default_thinking_path = _profile_thinking_file(DEFAULT_PROFILE_ID)
+    if LEGACY_THINKING_FILE.exists() and not default_thinking_path.exists():
+        default_thinking_path.parent.mkdir(parents=True, exist_ok=True)
+        default_thinking_path.write_text(LEGACY_THINKING_FILE.read_text(encoding="utf-8"), encoding="utf-8")
 
 
 def _load_active_profile_id() -> str:
@@ -159,6 +176,22 @@ def _save_guidance_text(profile_id: str, text: str) -> str:
     guidance_file.parent.mkdir(parents=True, exist_ok=True)
     guidance_file.write_text(f"{clean_text}\n" if clean_text else "", encoding="utf-8")
     return clean_text
+
+
+def _load_thinking_enabled(profile_id: str | None = None) -> bool:
+    resolved_profile_id = profile_id or _load_active_profile_id()
+    try:
+        raw = _profile_thinking_file(resolved_profile_id).read_text(encoding="utf-8").strip().lower()
+    except FileNotFoundError:
+        return False
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _save_thinking_enabled(profile_id: str, enabled: bool) -> bool:
+    thinking_file = _profile_thinking_file(profile_id)
+    thinking_file.parent.mkdir(parents=True, exist_ok=True)
+    thinking_file.write_text("1\n" if enabled else "0\n", encoding="utf-8")
+    return enabled
 
 
 def _session_title_from_prompt(prompt: str) -> str:
@@ -334,6 +367,7 @@ def _load_state_from_session(state: dict[str, Any], profile_id: str, session_id:
 
     state["active_profile_id"] = profile_id
     state["guidance_text"] = _load_guidance_text(profile_id)
+    state["thinking_enabled"] = _load_thinking_enabled(profile_id)
     state["active_session_id"] = session["id"]
     state["sessions"] = _list_profile_sessions(profile_id)
     state["transcript"] = list(session.get("transcript") or [])
@@ -353,6 +387,7 @@ def _new_browser_state(profile_id: str | None = None) -> dict[str, Any]:
         "active_session_id": "",
         "busy": False,
         "guidance_text": "",
+        "thinking_enabled": False,
         "active_profile_id": profile_id or _load_active_profile_id(),
         "updated_at": time.time(),
     }
@@ -373,6 +408,7 @@ def _serialize_state(state: dict[str, Any]) -> dict[str, Any]:
         "backend_mode": BACKEND_MODE,
         "proxy_base_url": PROXY_BASE_URL,
         "guidance_text": state.get("guidance_text", ""),
+        "thinking_enabled": bool(state.get("thinking_enabled")),
         "active_profile_id": state.get("active_profile_id", DEFAULT_PROFILE_ID),
         "profiles_supported": PROFILES_SUPPORTED,
         "sessions": state.get("sessions", []),
@@ -488,8 +524,8 @@ def _guidance_message(guidance_text: str) -> dict[str, str] | None:
     }
 
 
-def _chat_control_message() -> dict[str, str] | None:
-    if not FORCE_NO_THINK:
+def _chat_control_message(thinking_enabled: bool) -> dict[str, str] | None:
+    if thinking_enabled and not FORCE_NO_THINK:
         return None
     return {
         "role": "system",
@@ -513,6 +549,7 @@ def _build_chat_request_body(
     session_id: str,
     turn_type: str,
     session_done: bool,
+    thinking_enabled: bool,
     max_tokens: int | None = None,
     stream: bool,
 ) -> dict[str, Any]:
@@ -520,6 +557,7 @@ def _build_chat_request_body(
         "model": MODEL_NAME,
         "messages": messages,
         "stream": stream,
+        "enable_thinking": bool(thinking_enabled) and not FORCE_NO_THINK,
     }
     if BACKEND_MODE == "rl_proxy":
         body.update(
@@ -600,6 +638,7 @@ async def _proxy_chat(
     session_id: str,
     turn_type: str,
     session_done: bool,
+    thinking_enabled: bool,
     max_tokens: int | None = None,
 ) -> dict[str, Any]:
     body = _build_chat_request_body(
@@ -607,6 +646,7 @@ async def _proxy_chat(
         session_id=session_id,
         turn_type=turn_type,
         session_done=session_done,
+        thinking_enabled=thinking_enabled,
         max_tokens=max_tokens,
         stream=False,
     )
@@ -656,6 +696,7 @@ async def _proxy_chat_stream(
     session_id: str,
     turn_type: str,
     session_done: bool,
+    thinking_enabled: bool,
     max_tokens: int | None = None,
 ):
     body = _build_chat_request_body(
@@ -663,6 +704,7 @@ async def _proxy_chat_stream(
         session_id=session_id,
         turn_type=turn_type,
         session_done=session_done,
+        thinking_enabled=thinking_enabled,
         max_tokens=max_tokens,
         stream=True,
     )
@@ -699,11 +741,13 @@ async def _proxy_chat_stream(
                     choice = choices[0]
                     delta = choice.get("delta") or {}
                     content = delta.get("content") or ""
+                    reasoning_content = delta.get("reasoning_content") or ""
                     metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
-                    if content or metrics:
+                    if content or reasoning_content or metrics:
                         yield {
                             "type": "delta",
                             "content": content,
+                            "reasoning_content": reasoning_content,
                             "metrics": metrics,
                             "payload": payload,
                         }
@@ -1085,6 +1129,9 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
         state["busy"] = True
         context_messages = list(state["context_messages"])
         guidance_text = state.get("guidance_text", "")
+        thinking_enabled = bool(body.thinking_enabled) if body.thinking_enabled is not None else bool(state.get("thinking_enabled"))
+        if FORCE_NO_THINK:
+            thinking_enabled = False
         _touch_state(state)
 
     training_session_id = uuid.uuid4().hex
@@ -1102,12 +1149,13 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
         "feedback": None,
         "feedback_pending": False,
         "reasoning": "",
+        "thinking_enabled": thinking_enabled,
         "streaming": True,
         "metrics": None,
     }
 
     prompt_messages: list[dict[str, Any]] = []
-    chat_control_message = _chat_control_message()
+    chat_control_message = _chat_control_message(thinking_enabled)
     if chat_control_message is not None:
         prompt_messages.append(chat_control_message)
     guidance_message = _guidance_message(guidance_text)
@@ -1119,7 +1167,9 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
     async def event_stream():
         committed = False
         final_text = ""
+        final_reasoning = ""
         last_metrics: dict[str, Any] | None = None
+        requested_max_tokens = UI_THINKING_MAX_TOKENS if thinking_enabled else UI_MAX_TOKENS
 
         try:
             yield _sse_event(
@@ -1135,7 +1185,8 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
                 session_id=training_session_id,
                 turn_type="main",
                 session_done=False,
-                max_tokens=UI_MAX_TOKENS,
+                thinking_enabled=thinking_enabled,
+                max_tokens=requested_max_tokens,
             ):
                 if await request.is_disconnected():
                     raise asyncio.CancelledError()
@@ -1146,15 +1197,19 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
 
                 if event["type"] == "delta":
                     delta = str(event.get("content") or "")
+                    reasoning_delta = str(event.get("reasoning_content") or "")
                     if delta:
                         final_text += delta
-                    if not delta and not metrics:
+                    if reasoning_delta:
+                        final_reasoning += reasoning_delta
+                    if not delta and not reasoning_delta and not metrics:
                         continue
                     yield _sse_event(
                         "delta",
                         {
                             "assistant_turn_id": assistant_turn["id"],
                             "delta": delta,
+                            "reasoning_delta": reasoning_delta,
                             "metrics": metrics,
                         },
                     )
@@ -1171,12 +1226,16 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
                     )
 
             assistant_text = final_text.strip()
+            assistant_reasoning = final_reasoning.strip()
+            if not assistant_text and assistant_reasoning:
+                assistant_text = assistant_reasoning
             if not assistant_text:
                 raise HTTPException(status_code=502, detail="Model returned an empty response")
 
             completed_assistant_turn = {
                 **assistant_turn,
                 "content": assistant_text,
+                "reasoning": assistant_reasoning,
                 "feedback_pending": True,
                 "streaming": False,
                 "metrics": last_metrics,
@@ -1432,6 +1491,22 @@ async def api_guidance(request: Request, body: GuidanceRequest) -> JSONResponse:
                 state["guidance_text"] = clean_text
                 _touch_state(state)
         payload = {"ok": True, "state": _serialize_state(_browser_sessions[browser_id])}
+    return _response_with_cookie(payload, browser_id, created)
+
+
+@app.post("/api/thinking")
+async def api_thinking(request: Request, body: ThinkingRequest) -> Response:
+    browser_id, _, created = _ensure_browser_session(request)
+    with _state_lock:
+        state = _browser_sessions[browser_id]
+        if state["busy"]:
+            raise HTTPException(status_code=409, detail="Cannot change thinking mode while a response is streaming")
+        profile_id = str(state.get("active_profile_id") or DEFAULT_PROFILE_ID)
+        enabled = False if FORCE_NO_THINK else bool(body.enabled)
+        _save_thinking_enabled(profile_id, enabled)
+        state["thinking_enabled"] = enabled
+        _touch_state(state)
+        payload = {"ok": True, "state": _serialize_state(state)}
     return _response_with_cookie(payload, browser_id, created)
 
 
