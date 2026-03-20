@@ -443,18 +443,33 @@ def _first_model_device() -> torch.device:
     return next(_model.parameters()).device
 
 
-def _chat_template_kwargs() -> dict[str, Any]:
+def _bool_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+def _chat_template_kwargs(*, enable_thinking: bool) -> dict[str, Any]:
     return {
         "tokenize": True,
-        "enable_thinking": False,
+        "enable_thinking": bool(enable_thinking),
     }
 
 
-def _tokenize_messages(messages: list[dict[str, str]], *, add_generation_prompt: bool) -> torch.Tensor:
+def _tokenize_messages(
+    messages: list[dict[str, str]],
+    *,
+    add_generation_prompt: bool,
+    enable_thinking: bool = False,
+) -> torch.Tensor:
     ids = _tokenizer.apply_chat_template(
         messages,
         add_generation_prompt=add_generation_prompt,
-        **_chat_template_kwargs(),
+        **_chat_template_kwargs(enable_thinking=enable_thinking),
     )
     if not isinstance(ids, str) and hasattr(ids, "get"):
         extracted_ids = ids.get("input_ids")
@@ -523,6 +538,46 @@ def _strip_thinking_partial(text: str, *, final: bool) -> str:
     return cleaned.strip()
 
 
+def _trim_partial_markup(text: str, *, final: bool) -> str:
+    if final:
+        return text.strip()
+    tail_lt = text.rfind("<")
+    tail_gt = text.rfind(">")
+    if tail_lt > tail_gt and len(text) - tail_lt <= 32:
+        text = text[:tail_lt]
+    return text.lstrip()
+
+
+def _split_thinking_text(text: str, *, final: bool) -> tuple[str, str]:
+    cleaned = text.replace("<|im_end|>", "").replace("<|endoftext|>", "")
+    open_idx = cleaned.find("<think>")
+    if open_idx == -1:
+        close_idx = cleaned.find("</think>")
+        if close_idx != -1:
+            reasoning = _trim_partial_markup(cleaned[:close_idx], final=final)
+            content = _trim_partial_markup(cleaned[close_idx + len("</think>") :], final=final)
+            return reasoning, content
+        if not final:
+            reasoning = _trim_partial_markup(cleaned, final=False)
+            return reasoning, ""
+        content = _trim_partial_markup(cleaned, final=final)
+        return "", content
+
+    before = cleaned[:open_idx]
+    after_open = cleaned[open_idx + len("<think>") :]
+    close_idx = after_open.find("</think>")
+    if close_idx == -1:
+        reasoning = after_open
+        content = before
+    else:
+        reasoning = after_open[:close_idx]
+        content = before + after_open[close_idx + len("</think>") :]
+
+    reasoning = _trim_partial_markup(reasoning, final=final)
+    content = _trim_partial_markup(content, final=final)
+    return reasoning, content
+
+
 def _generation_kwargs(
     *,
     max_tokens: int,
@@ -553,14 +608,19 @@ def _sse_data(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-def _stream_metrics(text: str, *, started_at: float) -> dict[str, Any]:
+def _stream_metrics(*, visible_text: str, raw_text: str, started_at: float) -> dict[str, Any]:
     visible_tokens = 0
-    if text.strip():
-        visible_tokens = len(_tokenizer.encode(text, add_special_tokens=False))
+    if visible_text.strip():
+        visible_tokens = len(_tokenizer.encode(visible_text, add_special_tokens=False))
+    generated_tokens = 0
+    cleaned_raw = raw_text.replace("<|im_end|>", "").replace("<|endoftext|>", "")
+    if cleaned_raw.strip():
+        generated_tokens = len(_tokenizer.encode(cleaned_raw, add_special_tokens=False))
     elapsed = max(time.perf_counter() - started_at, 1e-3)
     return {
         "visible_tokens": visible_tokens,
-        "tokens_per_second": round(visible_tokens / elapsed, 2),
+        "generated_tokens": generated_tokens,
+        "tokens_per_second": round(generated_tokens / elapsed, 2),
         "elapsed_seconds": round(elapsed, 3),
     }
 
@@ -674,14 +734,14 @@ def _load_model() -> None:
     _loaded_at = time.time()
 
 
-def _build_inputs(messages: list[dict[str, str]]) -> dict[str, torch.Tensor]:
+def _build_inputs(messages: list[dict[str, str]], *, enable_thinking: bool = False) -> dict[str, torch.Tensor]:
     batch = _tokenizer.apply_chat_template(
         messages,
         tokenize=True,
         add_generation_prompt=True,
         return_tensors="pt",
         return_dict=True,
-        enable_thinking=False,
+        enable_thinking=enable_thinking,
     )
     batch = _truncate_inputs(batch)
     device = _first_model_device()
@@ -735,11 +795,12 @@ def _generate_chat_completion(body: dict[str, Any]) -> dict[str, Any]:
     max_tokens = max(1, min(max_tokens, 1024))
     temperature = float(body.get("temperature") if body.get("temperature") is not None else DEFAULT_TEMPERATURE)
     top_p = float(body.get("top_p") if body.get("top_p") is not None else DEFAULT_TOP_P)
+    enable_thinking = _bool_flag(body.get("enable_thinking") or body.get("thinking"))
 
     with _model_lock:
         _load_model()
         _model.eval()
-        inputs = _build_inputs(messages)
+        inputs = _build_inputs(messages, enable_thinking=enable_thinking)
         prompt_len = int(inputs["input_ids"].shape[-1])
         generation_kwargs = _generation_kwargs(
             max_tokens=max_tokens,
@@ -751,7 +812,10 @@ def _generate_chat_completion(body: dict[str, Any]) -> dict[str, Any]:
 
         new_tokens = generated[0][prompt_len:]
         raw_text = _tokenizer.decode(new_tokens, skip_special_tokens=False)
-        text = _strip_thinking(raw_text)
+        reasoning_text, text = _split_thinking_text(raw_text, final=True)
+        if not enable_thinking:
+            text = _strip_thinking(raw_text)
+            reasoning_text = ""
         if not text:
             text = raw_text.strip()
 
@@ -771,6 +835,7 @@ def _generate_chat_completion(body: dict[str, Any]) -> dict[str, Any]:
                 "message": {
                     "role": "assistant",
                     "content": text,
+                    "reasoning_content": reasoning_text,
                 },
                 "finish_reason": "stop",
             }
@@ -789,17 +854,18 @@ async def _stream_chat_completion(body: dict[str, Any]):
     max_tokens = max(1, min(max_tokens, 1024))
     temperature = float(body.get("temperature") if body.get("temperature") is not None else DEFAULT_TEMPERATURE)
     top_p = float(body.get("top_p") if body.get("top_p") is not None else DEFAULT_TOP_P)
+    enable_thinking = _bool_flag(body.get("enable_thinking") or body.get("thinking"))
     response_id = f"chatcmpl-{uuid.uuid4().hex}"
     created_at = int(time.time())
-    started_at = time.perf_counter()
     stop_event = threading.Event()
     thread_error: dict[str, BaseException] = {}
 
     with _model_lock:
         _load_model()
         _model.eval()
-        inputs = _build_inputs(messages)
+        inputs = _build_inputs(messages, enable_thinking=enable_thinking)
         prompt_len = int(inputs["input_ids"].shape[-1])
+        started_at = time.perf_counter()
         streamer = AsyncTextIteratorStreamer(
             _tokenizer,
             skip_prompt=True,
@@ -829,21 +895,35 @@ async def _stream_chat_completion(body: dict[str, Any]):
         worker.start()
 
         raw_text = ""
+        reasoning_text = ""
         visible_text = ""
         sent_role = False
 
         try:
             async for piece in streamer:
                 raw_text += piece
-                next_visible = _strip_thinking_partial(raw_text, final=False)
+                if enable_thinking:
+                    next_reasoning, next_visible = _split_thinking_text(raw_text, final=False)
+                else:
+                    next_reasoning = ""
+                    next_visible = _strip_thinking_partial(raw_text, final=False)
+                if next_reasoning.startswith(reasoning_text):
+                    reasoning_delta = next_reasoning[len(reasoning_text) :]
+                else:
+                    reasoning_delta = next_reasoning
+                reasoning_text = next_reasoning
                 if next_visible.startswith(visible_text):
                     delta = next_visible[len(visible_text) :]
                 else:
                     delta = next_visible
                 visible_text = next_visible
-                if not delta:
+                if not delta and not reasoning_delta:
                     continue
-                chunk_delta: dict[str, Any] = {"content": delta}
+                chunk_delta: dict[str, Any] = {}
+                if delta:
+                    chunk_delta["content"] = delta
+                if reasoning_delta:
+                    chunk_delta["reasoning_content"] = reasoning_delta
                 if not sent_role:
                     chunk_delta["role"] = "assistant"
                     sent_role = True
@@ -853,7 +933,7 @@ async def _stream_chat_completion(body: dict[str, Any]):
                         "object": "chat.completion.chunk",
                         "created": created_at,
                         "model": SERVED_MODEL_NAME,
-                        "metrics": _stream_metrics(visible_text, started_at=started_at),
+                        "metrics": _stream_metrics(visible_text=visible_text, raw_text=raw_text, started_at=started_at),
                         "choices": [{"index": 0, "delta": chunk_delta, "finish_reason": None}],
                     }
                 )
@@ -862,15 +942,28 @@ async def _stream_chat_completion(body: dict[str, Any]):
             if thread_error.get("error") is not None:
                 raise thread_error["error"]
 
-            final_visible = _strip_thinking_partial(raw_text, final=True)
+            if enable_thinking:
+                final_reasoning, final_visible = _split_thinking_text(raw_text, final=True)
+            else:
+                final_reasoning = ""
+                final_visible = _strip_thinking_partial(raw_text, final=True)
+            if final_reasoning.startswith(reasoning_text):
+                trailing_reasoning = final_reasoning[len(reasoning_text) :]
+            else:
+                trailing_reasoning = final_reasoning
+            reasoning_text = final_reasoning
             if final_visible.startswith(visible_text):
                 trailing = final_visible[len(visible_text) :]
             else:
                 trailing = final_visible
             visible_text = final_visible
 
-            if trailing:
-                chunk_delta = {"content": trailing}
+            if trailing or trailing_reasoning:
+                chunk_delta: dict[str, Any] = {}
+                if trailing:
+                    chunk_delta["content"] = trailing
+                if trailing_reasoning:
+                    chunk_delta["reasoning_content"] = trailing_reasoning
                 if not sent_role:
                     chunk_delta["role"] = "assistant"
                     sent_role = True
@@ -880,7 +973,7 @@ async def _stream_chat_completion(body: dict[str, Any]):
                         "object": "chat.completion.chunk",
                         "created": created_at,
                         "model": SERVED_MODEL_NAME,
-                        "metrics": _stream_metrics(visible_text, started_at=started_at),
+                        "metrics": _stream_metrics(visible_text=visible_text, raw_text=raw_text, started_at=started_at),
                         "choices": [{"index": 0, "delta": chunk_delta, "finish_reason": None}],
                     }
                 )
@@ -894,7 +987,7 @@ async def _stream_chat_completion(body: dict[str, Any]):
                     "object": "chat.completion.chunk",
                     "created": created_at,
                     "model": SERVED_MODEL_NAME,
-                    "metrics": _stream_metrics(visible_text, started_at=started_at),
+                    "metrics": _stream_metrics(visible_text=visible_text, raw_text=raw_text, started_at=started_at),
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                 }
             )

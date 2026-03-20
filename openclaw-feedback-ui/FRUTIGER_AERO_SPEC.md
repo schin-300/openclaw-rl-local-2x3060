@@ -117,6 +117,21 @@ These requirements were explicitly confirmed after the first desktop-shell pass 
 - Show `tok/s` for the currently streaming assistant response.
 - Place the stream speed on or directly under the active assistant bubble.
 - If practical, update the `tok/s` display live during generation instead of only after completion.
+- Use **generated tokens**, not just visible answer tokens, for the speed display when possible.
+- Do not start the tok/s timer until the request has the model lock and is actually beginning generation.
+
+### Thinking mode
+
+- Add a user-visible `Thinking` toggle in the chat chrome.
+- Persist the toggle with the saved local state for the active profile.
+- When thinking is off:
+  - keep the current clean final-answer flow
+  - avoid exposing reasoning text
+- When thinking is on:
+  - show reasoning in the chat UI itself
+  - keep reasoning visually distinct from the final answer
+  - allow a larger response token budget than normal chat so the model has room to think and still answer
+- If the model emits a close-think marker without a matching open marker, still split reasoning from final answer correctly.
 
 ### Verification target
 
@@ -274,15 +289,23 @@ This keeps the browser code simple and decouples it from backend chunk quirks.
 
 ### Thinking / hidden reasoning rule
 
-Streaming must preserve the current **non-thinking** behavior.
+Streaming must support both modes cleanly.
 
 Requirements:
 
-- do not expose `<think>` blocks or hidden reasoning text in the live stream
-- keep `enable_thinking=False`
-- if needed, filter or buffer streamed chunks so internal thinking markers never appear in the UI
+- when thinking is off:
+  - do not expose `<think>` blocks or hidden reasoning text in the live stream
+  - keep `enable_thinking=False`
+- when thinking is on:
+  - allow reasoning to stream visibly in a dedicated reasoning surface
+  - keep the final answer distinct from the reasoning block
+  - preserve enough token budget for the model to finish the thought and still answer
 
-Because the current backend already strips thinking at the end, streaming needs an incremental-safe version of that same rule instead of relying only on final cleanup.
+Because Qwen can emit imperfect thinking markers, the stream parser must handle:
+
+- normal `<think> ... </think>` wrapping
+- close-only `</think>` markers
+- partial streamed markers while the response is still arriving
 
 ### Locking and concurrency
 
