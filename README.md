@@ -75,6 +75,22 @@ cd /home/main/OpenClaw-RL
 ./switch-local-stack.sh status
 ```
 
+### Local Chat CLI
+
+The ChatGPT-style local UI now has a matching CLI that talks to the same `openclaw-feedback-ui` API and session flow.
+
+```bash
+cd /home/main/OpenClaw-RL
+python openclaw-feedback-ui/cli.py status
+python openclaw-feedback-ui/cli.py chat "Reply with exactly: hello from cli."
+python openclaw-feedback-ui/cli.py reset
+python openclaw-feedback-ui/cli.py session list
+python openclaw-feedback-ui/cli.py guidance set "Be concise and practical."
+python openclaw-feedback-ui/cli.py shell
+```
+
+There is also a small launcher at [`openclaw-feedback-ui/openclaw-chat`](./openclaw-feedback-ui/openclaw-chat).
+
 
 
 
