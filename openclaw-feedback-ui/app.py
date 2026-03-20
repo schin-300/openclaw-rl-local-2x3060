@@ -1306,10 +1306,13 @@ async def api_chat(request: Request, body: ChatRequest) -> JSONResponse:
         state["busy"] = True
         context_messages = list(state["context_messages"])
         guidance_text = state.get("guidance_text", "")
+        thinking_enabled = bool(body.thinking_enabled) if body.thinking_enabled is not None else bool(state.get("thinking_enabled"))
+        if FORCE_NO_THINK:
+            thinking_enabled = False
 
     training_session_id = uuid.uuid4().hex
     prompt_messages: list[dict[str, Any]] = []
-    chat_control_message = _chat_control_message()
+    chat_control_message = _chat_control_message(thinking_enabled)
     if chat_control_message is not None:
         prompt_messages.append(chat_control_message)
     guidance_message = _guidance_message(guidance_text)
@@ -1324,6 +1327,7 @@ async def api_chat(request: Request, body: ChatRequest) -> JSONResponse:
             session_id=training_session_id,
             turn_type="main",
             session_done=False,
+            thinking_enabled=thinking_enabled,
             max_tokens=UI_MAX_TOKENS,
         )
         choice = (proxy_response.get("choices") or [{}])[0]
@@ -1346,6 +1350,7 @@ async def api_chat(request: Request, body: ChatRequest) -> JSONResponse:
             "feedback": None,
             "feedback_pending": True,
             "reasoning": (assistant_message.get("reasoning_content") or "").strip(),
+            "thinking_enabled": thinking_enabled,
             "metrics": None,
         }
 
