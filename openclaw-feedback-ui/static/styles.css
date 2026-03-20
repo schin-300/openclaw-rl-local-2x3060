@@ -173,6 +173,7 @@ button:disabled {
 
 .status-chip,
 .model-pill,
+.thinking-toggle,
 .profile-badge,
 .profile-stat,
 .feedback-pill,
@@ -187,6 +188,22 @@ button:disabled {
   color: var(--text-secondary);
   border: 1px solid var(--bg-border);
   background: rgba(255, 255, 255, 0.04);
+}
+
+.thinking-toggle {
+  appearance: none;
+  cursor: pointer;
+  font: inherit;
+  transition:
+    background-color 140ms ease,
+    border-color 140ms ease,
+    color 140ms ease;
+}
+
+.thinking-toggle.active {
+  color: #c7f3e2;
+  border-color: rgba(63, 177, 121, 0.34);
+  background: rgba(45, 165, 111, 0.18);
 }
 
 .status-chip.status-good {
