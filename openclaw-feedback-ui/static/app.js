@@ -32,6 +32,8 @@ const els = {
   guidanceStatus: document.getElementById("guidance-status"),
   proxyStatus: document.getElementById("proxy-status"),
   modelLabel: document.getElementById("model-label"),
+  windowModelTitle: document.getElementById("window-model-title"),
+  windowModelEyebrow: document.getElementById("window-model-eyebrow"),
   thinkingToggle: document.getElementById("thinking-toggle"),
   newSessionButton: document.getElementById("new-session-button"),
   sessionList: document.getElementById("session-list"),
@@ -386,7 +388,14 @@ function renderControls() {
   els.guidanceInput.disabled = disabled;
   els.guidanceSaveButton.disabled = disabled;
   els.newSessionButton.disabled = disabled;
-  els.modelLabel.textContent = state.model || "Model";
+  const connectedModel = state.model || "Model";
+  els.modelLabel.textContent = connectedModel;
+  if (els.windowModelTitle) {
+    els.windowModelTitle.textContent = state.model || "Local Chat";
+  }
+  if (els.windowModelEyebrow) {
+    els.windowModelEyebrow.textContent = state.model ? "CONNECTED MODEL" : "LOCAL CHAT";
+  }
   if (els.thinkingToggle) {
     els.thinkingToggle.disabled = disabled;
     els.thinkingToggle.classList.toggle("active", state.thinkingEnabled);
