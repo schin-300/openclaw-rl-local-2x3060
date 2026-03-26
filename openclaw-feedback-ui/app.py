@@ -24,6 +24,7 @@ STATIC_DIR = APP_DIR / "static"
 STATE_DIR = Path(os.environ.get("OPENCLAW_RL_UI_STATE_DIR", APP_DIR / "state")).expanduser()
 PROFILES_DIR = STATE_DIR / "profiles"
 LEGACY_GUIDANCE_FILE = STATE_DIR / "steering_notes.txt"
+LEGACY_SYSTEM_PROMPT_FILE = STATE_DIR / "system_prompt.txt"
 ACTIVE_PROFILE_FILE = STATE_DIR / "active_profile.txt"
 LEGACY_THINKING_FILE = STATE_DIR / "thinking_enabled.txt"
 FEEDBACK_LOG_FILE_VALUE = os.environ.get("OPENCLAW_RL_UI_FEEDBACK_LOG_FILE", "").strip()
@@ -127,6 +128,15 @@ class GuidanceRequest(BaseModel):
     text: str = ""
 
 
+class SystemPromptRequest(BaseModel):
+    text: str = ""
+
+
+class ProfileSettingsRequest(BaseModel):
+    guidance_text: str = ""
+    system_prompt_text: str = ""
+
+
 class ProfileCreateRequest(BaseModel):
     name: str = ""
     select_after_create: bool = True
@@ -152,6 +162,10 @@ def _profile_guidance_file(profile_id: str) -> Path:
     return _profile_dir(profile_id) / "steering_notes.txt"
 
 
+def _profile_system_prompt_file(profile_id: str) -> Path:
+    return _profile_dir(profile_id) / "system_prompt.txt"
+
+
 def _profile_thinking_file(profile_id: str) -> Path:
     return _profile_dir(profile_id) / "thinking_enabled.txt"
 
@@ -175,6 +189,10 @@ def _ensure_profile_storage() -> None:
     if LEGACY_GUIDANCE_FILE.exists() and not default_guidance_path.exists():
         default_guidance_path.parent.mkdir(parents=True, exist_ok=True)
         default_guidance_path.write_text(LEGACY_GUIDANCE_FILE.read_text(encoding="utf-8"), encoding="utf-8")
+    default_system_prompt_path = _profile_system_prompt_file(DEFAULT_PROFILE_ID)
+    if LEGACY_SYSTEM_PROMPT_FILE.exists() and not default_system_prompt_path.exists():
+        default_system_prompt_path.parent.mkdir(parents=True, exist_ok=True)
+        default_system_prompt_path.write_text(LEGACY_SYSTEM_PROMPT_FILE.read_text(encoding="utf-8"), encoding="utf-8")
     default_thinking_path = _profile_thinking_file(DEFAULT_PROFILE_ID)
     if LEGACY_THINKING_FILE.exists() and not default_thinking_path.exists():
         default_thinking_path.parent.mkdir(parents=True, exist_ok=True)
@@ -210,6 +228,23 @@ def _save_guidance_text(profile_id: str, text: str) -> str:
     guidance_file = _profile_guidance_file(profile_id)
     guidance_file.parent.mkdir(parents=True, exist_ok=True)
     guidance_file.write_text(f"{clean_text}\n" if clean_text else "", encoding="utf-8")
+    return clean_text
+
+
+def _load_system_prompt_text(profile_id: str | None = None) -> str:
+    resolved_profile_id = profile_id or _load_active_profile_id()
+    system_prompt_file = _profile_system_prompt_file(resolved_profile_id)
+    try:
+        return system_prompt_file.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return ""
+
+
+def _save_system_prompt_text(profile_id: str, text: str) -> str:
+    clean_text = text.strip()
+    system_prompt_file = _profile_system_prompt_file(profile_id)
+    system_prompt_file.parent.mkdir(parents=True, exist_ok=True)
+    system_prompt_file.write_text(f"{clean_text}\n" if clean_text else "", encoding="utf-8")
     return clean_text
 
 
@@ -402,6 +437,7 @@ def _load_state_from_session(state: dict[str, Any], profile_id: str, session_id:
 
     state["active_profile_id"] = profile_id
     state["guidance_text"] = _load_guidance_text(profile_id)
+    state["system_prompt_text"] = _load_system_prompt_text(profile_id)
     state["thinking_enabled"] = _load_thinking_enabled(profile_id)
     state["active_session_id"] = session["id"]
     state["sessions"] = _list_profile_sessions(profile_id)
@@ -422,6 +458,7 @@ def _new_browser_state(profile_id: str | None = None) -> dict[str, Any]:
         "active_session_id": "",
         "busy": False,
         "guidance_text": "",
+        "system_prompt_text": "",
         "thinking_enabled": False,
         "active_profile_id": profile_id or _load_active_profile_id(),
         "updated_at": time.time(),
@@ -447,6 +484,7 @@ def _serialize_state(state: dict[str, Any]) -> dict[str, Any]:
         "chat_proxy_base_url": CHAT_PROXY_BASE_URL,
         "training_proxy_base_url": TRAINING_PROXY_BASE_URL,
         "guidance_text": state.get("guidance_text", ""),
+        "system_prompt_text": state.get("system_prompt_text", ""),
         "thinking_enabled": bool(state.get("thinking_enabled")),
         "active_profile_id": state.get("active_profile_id", DEFAULT_PROFILE_ID),
         "profiles_supported": PROFILES_SUPPORTED,
@@ -591,6 +629,16 @@ def _guidance_message(guidance_text: str) -> dict[str, str] | None:
             "fictional example scenarios to generalize from.\n\n"
             f"{clean_text}"
         ),
+    }
+
+
+def _system_prompt_message(system_prompt_text: str) -> dict[str, str] | None:
+    clean_text = system_prompt_text.strip()
+    if not clean_text:
+        return None
+    return {
+        "role": "system",
+        "content": clean_text,
     }
 
 
@@ -917,7 +965,7 @@ def _commit_chat_turn(
     assistant_turn: dict[str, Any],
     prompt: str,
     assistant_text: str,
-    prompt_messages: list[dict[str, Any]],
+    training_prompt_messages: list[dict[str, Any]],
     training_session_id: str,
     guidance_text: str,
 ) -> None:
@@ -931,7 +979,7 @@ def _commit_chat_turn(
     )
     state["feedback_candidates"][assistant_turn["id"]] = {
         "training_session_id": training_session_id,
-        "prompt_messages": prompt_messages,
+        "prompt_messages": training_prompt_messages,
         "user_prompt": prompt,
         "guidance_text": guidance_text,
         "assistant_message": {"role": "assistant", "content": assistant_text},
@@ -1152,6 +1200,14 @@ def _guidance_size_bytes(profile_id: str) -> int:
         return 0
 
 
+def _system_prompt_size_bytes(profile_id: str) -> int:
+    system_prompt_file = _profile_system_prompt_file(profile_id)
+    try:
+        return system_prompt_file.stat().st_size
+    except FileNotFoundError:
+        return 0
+
+
 def _augment_profile_payload(payload: dict[str, Any]) -> dict[str, Any]:
     profiles = []
     for raw_profile in payload.get("profiles") or []:
@@ -1162,10 +1218,14 @@ def _augment_profile_payload(payload: dict[str, Any]) -> dict[str, Any]:
             continue
         guidance_bytes = _guidance_size_bytes(profile_id)
         guidance_text = _load_guidance_text(profile_id)
+        system_prompt_bytes = _system_prompt_size_bytes(profile_id)
+        system_prompt_text = _load_system_prompt_text(profile_id)
         profile = dict(raw_profile)
         profile["guidance_size_bytes"] = guidance_bytes
         profile["guidance_text"] = guidance_text
-        profile["total_size_bytes"] = int(profile.get("size_bytes") or 0) + guidance_bytes
+        profile["system_prompt_size_bytes"] = system_prompt_bytes
+        profile["system_prompt_text"] = system_prompt_text
+        profile["total_size_bytes"] = int(profile.get("size_bytes") or 0) + guidance_bytes + system_prompt_bytes
         profiles.append(profile)
     augmented = {
         "ok": bool(payload.get("ok", True)),
@@ -1177,6 +1237,21 @@ def _augment_profile_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if "profile" in payload and isinstance(payload.get("profile"), dict):
         augmented["profile"] = payload.get("profile")
     return augmented
+
+
+def _save_profile_text_settings(
+    profile_id: str,
+    *,
+    guidance_text: str | None = None,
+    system_prompt_text: str | None = None,
+) -> tuple[str, str]:
+    saved_guidance_text = _load_guidance_text(profile_id) if guidance_text is None else _save_guidance_text(profile_id, guidance_text)
+    saved_system_prompt_text = (
+        _load_system_prompt_text(profile_id)
+        if system_prompt_text is None
+        else _save_system_prompt_text(profile_id, system_prompt_text)
+    )
+    return saved_guidance_text, saved_system_prompt_text
 
 
 async def _proxy_profiles() -> dict[str, Any]:
@@ -1498,6 +1573,7 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
         state["busy"] = True
         context_messages = list(state["context_messages"])
         guidance_text = state.get("guidance_text", "")
+        system_prompt_text = state.get("system_prompt_text", "")
         thinking_enabled = bool(body.thinking_enabled) if body.thinking_enabled is not None else bool(state.get("thinking_enabled"))
         if FORCE_NO_THINK:
             thinking_enabled = False
@@ -1524,14 +1600,23 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
     }
 
     prompt_messages: list[dict[str, Any]] = []
+    training_prompt_messages: list[dict[str, Any]] = []
     chat_control_message = _chat_control_message(thinking_enabled)
     if chat_control_message is not None:
         prompt_messages.append(chat_control_message)
+        training_prompt_messages.append(chat_control_message)
+    system_prompt_message = _system_prompt_message(system_prompt_text)
+    if system_prompt_message is not None:
+        prompt_messages.append(system_prompt_message)
     guidance_message = _guidance_message(guidance_text)
     if guidance_message is not None:
         prompt_messages.append(guidance_message)
+        training_prompt_messages.append(guidance_message)
     prompt_messages.extend(context_messages)
-    prompt_messages.append({"role": "user", "content": prompt})
+    training_prompt_messages.extend(context_messages)
+    user_message = {"role": "user", "content": prompt}
+    prompt_messages.append(user_message)
+    training_prompt_messages.append(user_message)
 
     async def event_stream():
         committed = False
@@ -1708,7 +1793,7 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
                     assistant_turn=completed_assistant_turn,
                     prompt=prompt,
                     assistant_text=assistant_text,
-                    prompt_messages=prompt_messages,
+                    training_prompt_messages=training_prompt_messages,
                     training_session_id=training_session_id,
                     guidance_text=guidance_text,
                 )
@@ -1765,20 +1850,30 @@ async def api_chat(request: Request, body: ChatRequest) -> JSONResponse:
         state["busy"] = True
         context_messages = list(state["context_messages"])
         guidance_text = state.get("guidance_text", "")
+        system_prompt_text = state.get("system_prompt_text", "")
         thinking_enabled = bool(body.thinking_enabled) if body.thinking_enabled is not None else bool(state.get("thinking_enabled"))
         if FORCE_NO_THINK:
             thinking_enabled = False
 
     training_session_id = uuid.uuid4().hex
     prompt_messages: list[dict[str, Any]] = []
+    training_prompt_messages: list[dict[str, Any]] = []
     chat_control_message = _chat_control_message(thinking_enabled)
     if chat_control_message is not None:
         prompt_messages.append(chat_control_message)
+        training_prompt_messages.append(chat_control_message)
+    system_prompt_message = _system_prompt_message(system_prompt_text)
+    if system_prompt_message is not None:
+        prompt_messages.append(system_prompt_message)
     guidance_message = _guidance_message(guidance_text)
     if guidance_message is not None:
         prompt_messages.append(guidance_message)
+        training_prompt_messages.append(guidance_message)
     prompt_messages.extend(context_messages)
-    prompt_messages.append({"role": "user", "content": prompt})
+    training_prompt_messages.extend(context_messages)
+    user_message = {"role": "user", "content": prompt}
+    prompt_messages.append(user_message)
+    training_prompt_messages.append(user_message)
 
     try:
         proxy_response = await _proxy_chat(
@@ -1828,7 +1923,7 @@ async def api_chat(request: Request, body: ChatRequest) -> JSONResponse:
                 assistant_turn=assistant_turn,
                 prompt=prompt,
                 assistant_text=assistant_text,
-                prompt_messages=prompt_messages,
+                training_prompt_messages=training_prompt_messages,
                 training_session_id=training_session_id,
                 guidance_text=guidance_text,
             )
@@ -1955,12 +2050,51 @@ async def api_guidance(request: Request, body: GuidanceRequest) -> JSONResponse:
     browser_id, _, created = _ensure_browser_session(request)
     with _state_lock:
         current_profile_id = _browser_sessions[browser_id].get("active_profile_id", _load_active_profile_id())
-    clean_text = _save_guidance_text(current_profile_id, body.text)
+    clean_text, system_prompt_text = _save_profile_text_settings(current_profile_id, guidance_text=body.text)
 
     with _state_lock:
         for state in _browser_sessions.values():
             if state.get("active_profile_id", DEFAULT_PROFILE_ID) == current_profile_id:
                 state["guidance_text"] = clean_text
+                state["system_prompt_text"] = system_prompt_text
+                _touch_state(state)
+        payload = {"ok": True, "state": _serialize_state(_browser_sessions[browser_id])}
+    return _response_with_cookie(payload, browser_id, created)
+
+
+@app.post("/api/system-prompt")
+async def api_system_prompt(request: Request, body: SystemPromptRequest) -> JSONResponse:
+    browser_id, _, created = _ensure_browser_session(request)
+    with _state_lock:
+        current_profile_id = _browser_sessions[browser_id].get("active_profile_id", _load_active_profile_id())
+    guidance_text, system_prompt_text = _save_profile_text_settings(current_profile_id, system_prompt_text=body.text)
+
+    with _state_lock:
+        for state in _browser_sessions.values():
+            if state.get("active_profile_id", DEFAULT_PROFILE_ID) == current_profile_id:
+                state["guidance_text"] = guidance_text
+                state["system_prompt_text"] = system_prompt_text
+                _touch_state(state)
+        payload = {"ok": True, "state": _serialize_state(_browser_sessions[browser_id])}
+    return _response_with_cookie(payload, browser_id, created)
+
+
+@app.post("/api/profile-settings")
+async def api_profile_settings(request: Request, body: ProfileSettingsRequest) -> JSONResponse:
+    browser_id, _, created = _ensure_browser_session(request)
+    with _state_lock:
+        current_profile_id = _browser_sessions[browser_id].get("active_profile_id", _load_active_profile_id())
+    guidance_text, system_prompt_text = _save_profile_text_settings(
+        current_profile_id,
+        guidance_text=body.guidance_text,
+        system_prompt_text=body.system_prompt_text,
+    )
+
+    with _state_lock:
+        for state in _browser_sessions.values():
+            if state.get("active_profile_id", DEFAULT_PROFILE_ID) == current_profile_id:
+                state["guidance_text"] = guidance_text
+                state["system_prompt_text"] = system_prompt_text
                 _touch_state(state)
         payload = {"ok": True, "state": _serialize_state(_browser_sessions[browser_id])}
     return _response_with_cookie(payload, browser_id, created)

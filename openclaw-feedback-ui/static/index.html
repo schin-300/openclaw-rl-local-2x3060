@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>OpenClaw Live RL Chat</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260326c" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260326e" />
   </head>
   <body>
     <div class="app-shell" id="app-shell">
@@ -85,17 +85,27 @@
           </div>
           <div class="notes-body">
             <div class="notepad-sheet">
+              <label class="field-label" for="system-prompt-input">System prompt</label>
+              <p class="notepad-caption">
+                Optional per-profile prompt for inference only. It shapes replies, but it is not sent into RL feedback or training.
+              </p>
+              <textarea
+                id="system-prompt-input"
+                rows="6"
+                placeholder="Example: You are concise, direct, and helpful. Prefer short paragraphs, avoid roleplay, and do not act overly submissive."
+              ></textarea>
+              <label class="field-label" for="guidance-input">Steering notes</label>
               <p class="notepad-caption">
                 Keep compact steering notes for the active profile without leaving the main chat flow.
               </p>
               <textarea
                 id="guidance-input"
-                rows="16"
+                rows="10"
                 placeholder="Example: If I ask for a refactor, preserve behavior first. If a fictional scenario is underspecified, ask one sharp clarifying question instead of guessing."
               ></textarea>
               <div class="notepad-actions">
-                <p class="save-status" id="guidance-status">Saved notes apply to future prompts.</p>
-                <button class="primary-button" id="guidance-save-button" type="button">Save</button>
+                <p class="save-status" id="guidance-status">Saved profile notes apply to future prompts.</p>
+                <button class="primary-button" id="guidance-save-button" type="button">Save notes</button>
               </div>
             </div>
           </div>
@@ -124,7 +134,7 @@
                 Create and switch
               </button>
               <p class="profile-create-status" id="profile-create-status">
-                Each profile keeps its own chats, notes, and training state.
+                Each profile keeps its own chats, notes, system prompt, and training state.
               </p>
             </section>
 
@@ -177,6 +187,6 @@
       </article>
     </template>
 
-    <script src="/static/app.js?v=20260326c"></script>
+    <script src="/static/app.js?v=20260326e"></script>
   </body>
 </html>

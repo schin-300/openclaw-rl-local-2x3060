@@ -137,6 +137,9 @@ class LocalChatClient:
     def set_guidance(self, text: str) -> dict[str, Any]:
         return self._read_json_response(self._open("POST", "/api/guidance", json_body={"text": text}))
 
+    def set_system_prompt(self, text: str) -> dict[str, Any]:
+        return self._read_json_response(self._open("POST", "/api/system-prompt", json_body={"text": text}))
+
     def set_thinking(self, enabled: bool) -> dict[str, Any]:
         return self._read_json_response(self._open("POST", "/api/thinking", json_body={"enabled": enabled}))
 
@@ -285,6 +288,13 @@ def build_parser() -> argparse.ArgumentParser:
     guidance_set_parser.add_argument("text", nargs="+", help="Guidance text")
     guidance_subparsers.add_parser("clear", help="Clear saved guidance")
 
+    system_prompt_parser = subparsers.add_parser("system-prompt", help="Show or update the profile system prompt")
+    system_prompt_subparsers = system_prompt_parser.add_subparsers(dest="system_prompt_command", required=True)
+    system_prompt_subparsers.add_parser("show", help="Show the saved system prompt")
+    system_prompt_set_parser = system_prompt_subparsers.add_parser("set", help="Replace the saved system prompt")
+    system_prompt_set_parser.add_argument("text", nargs="+", help="System prompt text")
+    system_prompt_subparsers.add_parser("clear", help="Clear the saved system prompt")
+
     thinking_parser = subparsers.add_parser("thinking", help="Toggle stored thinking mode")
     thinking_parser.add_argument("mode", choices=("on", "off"), help="Stored thinking mode")
 
@@ -315,11 +325,13 @@ def format_status(payload: dict[str, Any]) -> str:
     healthy = router.get("healthy_count", 0)
     workers = router.get("worker_count", 0)
     reason = proxy.get("reason") or ("ready" if proxy.get("ok") else "unknown")
+    has_system_prompt = bool(str(state.get("system_prompt_text") or "").strip())
     lines = [
         f"Model: {state.get('model') or '(unknown)'}",
         f"Backend: {state.get('backend_mode') or '(unknown)'}",
         f"Profile: {state.get('active_profile_id') or '(none)'}",
         f"Session: {active_session_label(state)}",
+        f"System prompt: {'set' if has_system_prompt else 'empty'}",
         f"Thinking: {'on' if state.get('thinking_enabled') else 'off'}",
         f"Proxy: {'ready' if proxy.get('ok') else 'not ready'} ({reason})",
         f"Workers: {healthy}/{workers} healthy",
@@ -330,6 +342,11 @@ def format_status(payload: dict[str, Any]) -> str:
 def guidance_text_from_state(payload: dict[str, Any]) -> str:
     state = payload.get("state") or {}
     return str(state.get("guidance_text") or "").strip()
+
+
+def system_prompt_text_from_state(payload: dict[str, Any]) -> str:
+    state = payload.get("state") or {}
+    return str(state.get("system_prompt_text") or "").strip()
 
 
 def run_status(client: LocalChatClient, args: argparse.Namespace) -> int:
@@ -389,6 +406,24 @@ def run_guidance(client: LocalChatClient, args: argparse.Namespace) -> int:
     raise CliError(f"Unsupported guidance command: {args.guidance_command}")
 
 
+def run_system_prompt(client: LocalChatClient, args: argparse.Namespace) -> int:
+    if args.system_prompt_command == "show":
+        payload = client.get_state()
+        text = system_prompt_text_from_state(payload)
+        print(text if text else "(empty)")
+        return 0
+    if args.system_prompt_command == "set":
+        text = " ".join(args.text).strip()
+        client.set_system_prompt(text)
+        print("Saved system prompt.")
+        return 0
+    if args.system_prompt_command == "clear":
+        client.set_system_prompt("")
+        print("Cleared system prompt.")
+        return 0
+    raise CliError(f"Unsupported system prompt command: {args.system_prompt_command}")
+
+
 def run_thinking(client: LocalChatClient, args: argparse.Namespace) -> int:
     enabled = args.mode == "on"
     payload = client.set_thinking(enabled)
@@ -431,7 +466,8 @@ def run_session(client: LocalChatClient, args: argparse.Namespace) -> int:
 def print_shell_help() -> None:
     print(
         "Slash commands: /help, /status, /reset, /sessions, /use <session-id>, /guidance show, "
-        "/guidance set <text>, /guidance clear, /thinking on|off, /feedback <1-10> [note], /exit"
+        "/guidance set <text>, /guidance clear, /system show, /system set <text>, /system clear, "
+        "/thinking on|off, /feedback <1-10> [note], /exit"
     )
 
 
@@ -517,6 +553,24 @@ def run_shell(client: LocalChatClient) -> int:
                     print("Saved guidance.")
                     continue
                 raise CliError("Use /guidance show, /guidance set <text>, or /guidance clear")
+            if command in {"system", "system-prompt"}:
+                if len(parts) == 1 or parts[1] == "show":
+                    payload = client.get_state()
+                    text = system_prompt_text_from_state(payload)
+                    print(text if text else "(empty)")
+                    continue
+                if parts[1] == "clear":
+                    client.set_system_prompt("")
+                    print("Cleared system prompt.")
+                    continue
+                if parts[1] == "set":
+                    text = " ".join(parts[2:]).strip()
+                    if not text:
+                        raise CliError("Provide system prompt text after /system set")
+                    client.set_system_prompt(text)
+                    print("Saved system prompt.")
+                    continue
+                raise CliError("Use /system show, /system set <text>, or /system clear")
             if command == "thinking":
                 if len(parts) < 2 or parts[1] not in {"on", "off"}:
                     raise CliError("Use /thinking on or /thinking off")
@@ -555,6 +609,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_feedback(client, args)
         if args.command == "guidance":
             return run_guidance(client, args)
+        if args.command == "system-prompt":
+            return run_system_prompt(client, args)
         if args.command == "thinking":
             return run_thinking(client, args)
         if args.command == "session":

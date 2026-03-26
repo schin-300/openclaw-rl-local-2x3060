@@ -12,6 +12,7 @@ const state = {
   proxyOk: null,
   proxyHealth: null,
   guidanceText: "",
+  systemPromptText: "",
   thinkingEnabled: false,
   activeProfileId: "",
   profiles: [],
@@ -26,6 +27,7 @@ const els = {
   emptyState: document.getElementById("empty-state"),
   sendButton: document.getElementById("send-button"),
   promptInput: document.getElementById("prompt-input"),
+  systemPromptInput: document.getElementById("system-prompt-input"),
   guidanceInput: document.getElementById("guidance-input"),
   guidanceSaveButton: document.getElementById("guidance-save-button"),
   guidanceStatus: document.getElementById("guidance-status"),
@@ -320,6 +322,7 @@ function renderProfiles() {
     const statValues = [
       `Total: ${formatBytes(profile.total_size_bytes ?? profile.size_bytes ?? 0)}`,
       `Notes: ${formatBytes(profile.guidance_size_bytes ?? 0)}`,
+      `Prompt: ${formatBytes(profile.system_prompt_size_bytes ?? 0)}`,
       `Updates: ${Number(training.total_updates || 0)}`,
       `Feedback: ${Number(training.total_feedback || 0)}`,
     ];
@@ -337,8 +340,8 @@ function renderProfiles() {
     hint.className = "profile-hint";
     hint.textContent =
       profile.id === state.activeProfileId
-        ? "Current profile for chats, notes, and live updates."
-        : "Switch to this profile's chats, notes, and learned state.";
+        ? "Current profile for chats, system prompt, notes, and live updates."
+        : "Switch to this profile's chats, system prompt, notes, and learned state.";
 
     const button = document.createElement("button");
     button.className = "profile-activate-button";
@@ -455,6 +458,7 @@ function renderControls() {
   const disabled = state.busy;
   els.sendButton.disabled = disabled || !els.promptInput.value.trim();
   els.promptInput.disabled = disabled;
+  els.systemPromptInput.disabled = disabled;
   els.guidanceInput.disabled = disabled;
   els.guidanceSaveButton.disabled = disabled;
   els.newSessionButton.disabled = disabled;
@@ -636,16 +640,20 @@ function applyServerState(serverState, proxyState = null, profilePayload = null)
   state.activeSessionId = serverState.active_session_id || "";
   state.sessions = Array.isArray(serverState.sessions) ? serverState.sessions : [];
   state.guidanceText = serverState.guidance_text || "";
+  state.systemPromptText = serverState.system_prompt_text || "";
   state.thinkingEnabled = Boolean(serverState.thinking_enabled);
 
+  if (els.systemPromptInput.value !== state.systemPromptText) {
+    els.systemPromptInput.value = state.systemPromptText;
+  }
   if (els.guidanceInput.value !== state.guidanceText) {
     els.guidanceInput.value = state.guidanceText;
   }
 
   setGuidanceStatus(
-    state.guidanceText
-      ? "Saved steering notes are active for future prompts."
-      : "No saved steering notes yet."
+    state.systemPromptText || state.guidanceText
+      ? "Saved system prompt and notes are active for this profile."
+      : "No saved system prompt or notes yet."
   );
 
   if (proxyState) {
@@ -873,15 +881,18 @@ async function sendFeedback(assistantTurnId) {
 async function saveGuidance() {
   setBusy(true);
   try {
-    const payload = await fetchJson("/api/guidance", {
+    const payload = await fetchJson("/api/profile-settings", {
       method: "POST",
-      body: JSON.stringify({ text: els.guidanceInput.value }),
+      body: JSON.stringify({
+        guidance_text: els.guidanceInput.value,
+        system_prompt_text: els.systemPromptInput.value,
+      }),
     });
     applyServerState(payload.state, { ok: state.proxyOk !== false });
     setGuidanceStatus(
-      payload.state.guidance_text
-        ? "Steering notes saved and active on future prompts."
-        : "Saved notes cleared."
+      payload.state.system_prompt_text || payload.state.guidance_text
+        ? "System prompt and notes saved for this profile."
+        : "Saved system prompt and notes cleared."
     );
     await refreshProfiles();
   } catch (error) {
@@ -907,9 +918,9 @@ async function selectProfile(profileId) {
     feedbackDrafts.clear();
     applyServerState(payload.state, { ok: state.proxyOk !== false }, payload);
     setGuidanceStatus(
-      payload.state.guidance_text
-        ? "Saved notes loaded for this profile."
-        : "No saved notes yet for this profile."
+      payload.state.system_prompt_text || payload.state.guidance_text
+        ? "Loaded saved system prompt and notes for this profile."
+        : "No saved system prompt or notes yet for this profile."
     );
     setProfileCreateStatus("Profile switched.");
   } catch (error) {
@@ -930,7 +941,7 @@ async function createProfile() {
   }
 
   setBusy(true);
-  setProfileCreateStatus("Creating profile...");
+    setProfileCreateStatus("Creating profile...");
   try {
     const payload = await fetchJson("/api/profiles", {
       method: "POST",
@@ -942,9 +953,9 @@ async function createProfile() {
     feedbackDrafts.clear();
     applyServerState(payload.state, { ok: state.proxyOk !== false }, payload);
     setGuidanceStatus(
-      payload.state.guidance_text
-        ? "Saved notes loaded for the new profile."
-        : "New profile created. Add steering notes whenever you want."
+      payload.state.system_prompt_text || payload.state.guidance_text
+        ? "Loaded saved system prompt and notes for the new profile."
+        : "New profile created. Add a system prompt or notes whenever you want."
     );
     setProfileCreateStatus("Profile created and activated.");
   } catch (error) {
@@ -1070,8 +1081,14 @@ els.promptInput.addEventListener("keydown", (event) => {
   }
 });
 
+if (els.systemPromptInput) {
+  els.systemPromptInput.addEventListener("input", () => {
+    setGuidanceStatus("Unsaved system prompt or notes changes.");
+  });
+}
+
 els.guidanceInput.addEventListener("input", () => {
-  setGuidanceStatus("Unsaved steering changes.");
+  setGuidanceStatus("Unsaved system prompt or notes changes.");
 });
 
 if (els.profileNameInput) {
