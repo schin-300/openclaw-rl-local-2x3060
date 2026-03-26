@@ -215,6 +215,10 @@ function upsertStreamingTurn(turn) {
   state.transcript = nextTranscript;
 }
 
+function hasStreamMetrics(metrics) {
+  return Boolean(metrics && typeof metrics === "object" && Object.keys(metrics).length > 0);
+}
+
 function appendStreamingDelta(turnId, delta, reasoningDelta = "", metrics = null) {
   const existingIndex = state.transcript.findIndex((item) => item.id === turnId);
   if (existingIndex === -1) {
@@ -222,18 +226,21 @@ function appendStreamingDelta(turnId, delta, reasoningDelta = "", metrics = null
   }
   const nextTranscript = [...state.transcript];
   const current = nextTranscript[existingIndex];
+  const nextMetrics = hasStreamMetrics(metrics)
+    ? { ...(current.metrics && typeof current.metrics === "object" ? current.metrics : {}), ...metrics }
+    : current.metrics || null;
   nextTranscript[existingIndex] = {
     ...current,
     content: `${current.content || ""}${delta || ""}`,
     reasoning: `${current.reasoning || ""}${reasoningDelta || ""}`,
-    metrics: metrics || current.metrics || null,
+    metrics: nextMetrics,
     streaming: true,
   };
   state.transcript = nextTranscript;
 }
 
 function setStreamingMetrics(turnId, metrics = null) {
-  if (!metrics) {
+  if (!hasStreamMetrics(metrics)) {
     return;
   }
   const existingIndex = state.transcript.findIndex((item) => item.id === turnId);
@@ -243,7 +250,12 @@ function setStreamingMetrics(turnId, metrics = null) {
   const nextTranscript = [...state.transcript];
   nextTranscript[existingIndex] = {
     ...nextTranscript[existingIndex],
-    metrics,
+    metrics: {
+      ...(nextTranscript[existingIndex].metrics && typeof nextTranscript[existingIndex].metrics === "object"
+        ? nextTranscript[existingIndex].metrics
+        : {}),
+      ...metrics,
+    },
   };
   state.transcript = nextTranscript;
 }
@@ -481,7 +493,7 @@ function renderMessageMetrics(message, item) {
   const tokenCount = message.querySelector(".stream-token-count");
   const speed = message.querySelector(".stream-speed");
   const metrics = item.metrics && typeof item.metrics === "object" ? item.metrics : null;
-  const visibleTokens = Number(metrics?.generated_tokens ?? metrics?.visible_tokens ?? NaN);
+  const visibleTokens = Number(metrics?.visible_tokens ?? metrics?.generated_tokens ?? NaN);
   const tokensPerSecond = Number(metrics?.tokens_per_second ?? NaN);
   const shouldShow = item.streaming || (Number.isFinite(visibleTokens) && visibleTokens > 0);
 

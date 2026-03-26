@@ -462,10 +462,17 @@ def _ensure_active_serving_adapter_path(*, force_refresh: bool = False) -> str |
 
     existing_value = str(_train_state.get("serving_adapter_path") or "").strip()
     existing_path = Path(existing_value).expanduser() if existing_value else None
+    active_profile_id = _get_active_profile_id()
+    aliases_dir = _profile_serving_aliases_dir(active_profile_id).expanduser().resolve()
     if not force_refresh and existing_path is not None and existing_path.exists():
-        return str(existing_path)
+        try:
+            resolved_existing = existing_path.resolve()
+            if existing_path.is_symlink() and resolved_existing == _active_adapter_dir() and existing_path.parent.resolve() == aliases_dir:
+                return str(existing_path)
+        except OSError:
+            pass
 
-    refreshed = _refresh_serving_adapter_alias(_get_active_profile_id())
+    refreshed = _refresh_serving_adapter_alias(active_profile_id)
     _train_state["serving_adapter_path"] = refreshed or ""
     _train_state["last_serving_synced_at"] = time.time() if refreshed else None
     _save_train_state()

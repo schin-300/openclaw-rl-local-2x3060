@@ -701,6 +701,60 @@ def _resolve_assistant_text(content: str, reasoning_text: str) -> str:
     return ""
 
 
+_TOKEN_ESTIMATE_PATTERN = re.compile(r"\w+|[^\w\s]", re.UNICODE)
+
+
+def _estimate_token_count(text: str) -> int:
+    clean_text = str(text or "").strip()
+    if not clean_text:
+        return 0
+    return len(_TOKEN_ESTIMATE_PATTERN.findall(clean_text))
+
+
+def _stream_metrics_fallback(
+    metrics: dict[str, Any] | None,
+    *,
+    visible_text: str,
+    reasoning_text: str,
+    started_at: float,
+    first_token_at: float | None,
+) -> dict[str, Any]:
+    merged = dict(metrics) if isinstance(metrics, dict) else {}
+
+    visible_tokens = merged.get("visible_tokens")
+    if not isinstance(visible_tokens, (int, float)) or visible_tokens < 0:
+        visible_tokens = _estimate_token_count(visible_text)
+    visible_tokens = max(int(round(float(visible_tokens))), 0)
+
+    generated_tokens = merged.get("generated_tokens")
+    if not isinstance(generated_tokens, (int, float)) or generated_tokens < visible_tokens:
+        combined_text = "\n".join(part for part in (reasoning_text.strip(), visible_text.strip()) if part)
+        generated_tokens = _estimate_token_count(combined_text) if combined_text else visible_tokens
+    generated_tokens = max(int(round(float(generated_tokens))), visible_tokens)
+
+    elapsed_seconds = merged.get("elapsed_seconds")
+    elapsed_started_at = first_token_at if first_token_at is not None else started_at
+    if not isinstance(elapsed_seconds, (int, float)) or elapsed_seconds <= 0:
+        elapsed_seconds = max(time.perf_counter() - elapsed_started_at, 1e-3)
+    elapsed_seconds = round(float(elapsed_seconds), 3)
+
+    tokens_per_second = merged.get("tokens_per_second")
+    if not isinstance(tokens_per_second, (int, float)) or tokens_per_second <= 0:
+        tokens_per_second = round(generated_tokens / max(elapsed_seconds, 1e-3), 2) if generated_tokens > 0 else 0.0
+    else:
+        tokens_per_second = round(float(tokens_per_second), 2)
+
+    merged.update(
+        {
+            "visible_tokens": visible_tokens,
+            "generated_tokens": generated_tokens,
+            "elapsed_seconds": elapsed_seconds,
+            "tokens_per_second": tokens_per_second,
+        }
+    )
+    return merged
+
+
 def _chat_backend_label() -> str:
     return "Chat backend" if _is_split_backend() else "Training backend"
 
@@ -1208,6 +1262,32 @@ def _should_restart_backend(detail: str) -> bool:
 def _restart_service(service_name: str) -> None:
     if not service_name:
         return
+    hard_restart = service_name == CHAT_SERVICE_NAME and CHAT_BACKEND_MODE == "openai_chat"
+    if hard_restart:
+        subprocess.run(
+            ["systemctl", "--user", "kill", "-s", "SIGKILL", service_name],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+        )
+        time.sleep(1)
+        subprocess.run(
+            ["systemctl", "--user", "reset-failed", service_name],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+        )
+        subprocess.run(
+            ["systemctl", "--user", "start", service_name],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+        )
+        return
+
     subprocess.run(
         ["systemctl", "--user", "restart", service_name],
         check=False,
@@ -1460,6 +1540,8 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
         last_metrics: dict[str, Any] | None = None
         finish_reason = "stop"
         streamed_raw_text = ""
+        stream_started_at = time.perf_counter()
+        first_token_at: float | None = None
         structured_visible_thinking = thinking_enabled and not USE_NATIVE_CHAT_THINKING and not FORCE_NO_THINK
         requested_max_tokens = UI_THINKING_MAX_TOKENS if thinking_enabled else UI_MAX_TOKENS
 
@@ -1483,13 +1565,14 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
                 if await request.is_disconnected():
                     raise asyncio.CancelledError()
 
-                metrics = event.get("metrics") or {}
-                if metrics:
-                    last_metrics = metrics
-
                 if event["type"] == "delta":
+                    raw_metrics = event.get("metrics") or {}
                     delta = str(event.get("content") or "")
                     reasoning_delta = str(event.get("reasoning_content") or "")
+                    if not delta and not reasoning_delta and not raw_metrics:
+                        continue
+                    if first_token_at is None and (delta or reasoning_delta or raw_metrics):
+                        first_token_at = time.perf_counter()
                     if structured_visible_thinking:
                         if delta:
                             streamed_raw_text += delta
@@ -1505,8 +1588,14 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
                             final_text += delta
                         if reasoning_delta:
                             final_reasoning += reasoning_delta
-                    if not delta and not reasoning_delta and not metrics:
-                        continue
+                    metrics = _stream_metrics_fallback(
+                        raw_metrics,
+                        visible_text=final_text,
+                        reasoning_text=final_reasoning,
+                        started_at=stream_started_at,
+                        first_token_at=first_token_at,
+                    )
+                    last_metrics = metrics
                     yield _sse_event(
                         "delta",
                         {
@@ -1520,6 +1609,13 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
 
                 if event["type"] == "finish":
                     finish_reason = str(event.get("finish_reason") or "stop")
+                    last_metrics = _stream_metrics_fallback(
+                        event.get("metrics") or last_metrics,
+                        visible_text=final_text,
+                        reasoning_text=final_reasoning,
+                        started_at=stream_started_at,
+                        first_token_at=first_token_at,
+                    )
 
             if structured_visible_thinking:
                 assistant_reasoning, assistant_text = _split_visible_thinking_response(streamed_raw_text, final=True)
@@ -1559,6 +1655,13 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
                 final_reasoning = assistant_reasoning
 
                 if delta or reasoning_delta:
+                    last_metrics = _stream_metrics_fallback(
+                        last_metrics,
+                        visible_text=assistant_text,
+                        reasoning_text=assistant_reasoning,
+                        started_at=stream_started_at,
+                        first_token_at=first_token_at,
+                    )
                     yield _sse_event(
                         "delta",
                         {
@@ -1572,6 +1675,13 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
             if not assistant_text and not assistant_reasoning:
                 raise HTTPException(status_code=502, detail="Model returned an empty response")
 
+            last_metrics = _stream_metrics_fallback(
+                last_metrics,
+                visible_text=assistant_text,
+                reasoning_text=assistant_reasoning,
+                started_at=stream_started_at,
+                first_token_at=first_token_at,
+            )
             yield _sse_event(
                 "final",
                 {
