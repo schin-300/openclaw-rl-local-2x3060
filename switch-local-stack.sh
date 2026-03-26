@@ -11,6 +11,7 @@ ALL_SERVICES=(
   openclaw-rl-qwen3-4b-ui.service
   qwen35-4b.service
   qwen35-feedback-ui.service
+  qwen35-sglang.service
 )
 
 stop_all() {
@@ -38,15 +39,15 @@ case "${STACK}" in
     stop_all
     systemctl --user daemon-reload
     systemctl --user start openclaw-rl-qwen3-4b.service openclaw-rl-qwen3-4b-ui.service
-    echo "Experimental Qwen3-4B RL stack starting."
+    echo "Qwen3-4B RL stack starting."
     echo "UI: http://127.0.0.1:30003"
     ;;
   qwen35)
     stop_all
     systemctl --user daemon-reload
-    systemctl --user start qwen35-4b.service qwen35-feedback-ui.service
-    echo "Experimental Qwen3.5-4B stack starting."
-    echo "UI: http://127.0.0.1:30005"
+    systemctl --user start qwen35-sglang.service qwen35-4b.service openclaw-rl-ui.service
+    echo "Qwen3.5-4B live stack starting."
+    echo "UI: http://127.0.0.1:30001"
     ;;
   stop)
     stop_all

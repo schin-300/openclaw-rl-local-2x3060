@@ -38,7 +38,7 @@ As of `2026-03-22`, the requested target is live and verified locally:
 
 1. `Qwen/Qwen3.5-4B` is the active model.
 2. Chat traffic is served through `SGLang`.
-3. The training/control plane still runs through `qwen35-experimental/server.py`
+3. The training/control plane still runs through `qwen35-live/server.py`
    and syncs the serving LoRA adapter into the SGLang worker.
 4. The ChatGPT-style UI on `30001` talks to the same local app contract for
    chat, streaming, health, profiles, and feedback.
@@ -47,7 +47,7 @@ As of `2026-03-22`, the requested target is live and verified locally:
 
 1. The local SGLang install needed a `qwen3_5` LoRA hidden-dimension fix in the
    model implementation so the Qwen3.5-4B adapter could load without crashing.
-   `main` now carries that patched file in `qwen35-experimental/sglang_patches/`
+   `main` now carries that patched file in `qwen35-live/sglang_patches/`
    and the SGLang launcher syncs it into the active venv on startup.
 2. The UI now avoids requesting separated reasoning from SGLang unless native
    SGLang thinking is intentionally enabled.

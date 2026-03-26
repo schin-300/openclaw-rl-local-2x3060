@@ -39,7 +39,7 @@ export RAY_health_check_timeout_ms=30000
 export RAY_num_heartbeats_timeout=60
 # The 4B FSDP actor causes large transient host-memory spikes during init on this
 # 62 GiB box. Ray's memory monitor has been killing the actor before Linux is out
-# of reclaimable headroom, so disable the guard for this experimental profile and
+# of reclaimable headroom, so disable the guard for this Qwen3-4B profile and
 # leave a near-max threshold as a fallback for code paths that still read it.
 export RAY_DISABLE_MEMORY_MONITOR="${RAY_DISABLE_MEMORY_MONITOR:-1}"
 export RAY_memory_monitor_refresh_ms="${RAY_memory_monitor_refresh_ms:-0}"

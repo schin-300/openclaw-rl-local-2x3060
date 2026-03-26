@@ -110,7 +110,7 @@ _DTYPE_BY_NAME = {
 }
 
 
-app = FastAPI(title="Qwen3.5 Experimental Server")
+app = FastAPI(title="Qwen3.5 Live Trainer Server")
 
 _model_lock = threading.RLock()
 _tokenizer = None

@@ -40,8 +40,8 @@ This fork packages a practical single-machine setup for running OpenClaw-RL on *
 ### What This Fork Adds
 
 - A working **2-GPU local LoRA training path** for `Qwen3-0.6B`
-- An experimental **Qwen3-4B** local RL path tuned for this box
-- A separate experimental **Qwen3.5-4B 4-bit** live-training path with a persistent LoRA adapter
+- A tuned **Qwen3-4B** local RL path for this box
+- A separate **Qwen3.5-4B 4-bit** live-training path with a persistent LoRA adapter
 - Browser-based **feedback UIs** at `http://127.0.0.1:30001`, `http://127.0.0.1:30003`, and `http://127.0.0.1:30005`
 - **1-10 explicit reward scoring** instead of only binary good/bad feedback
 - A persistent **steering notes and scenarios** panel that injects standing guidance into future prompts
@@ -60,15 +60,15 @@ This fork packages a practical single-machine setup for running OpenClaw-RL on *
 
 - This repo intentionally **does not include downloaded model weights, checkpoints, or runtime state**.
 - `Qwen3-0.6B` is the stable live-training baseline on this machine.
-- `Qwen3-4B` is an experimental live-training path and still needs more runtime hardening.
+- `Qwen3-4B` is a live-training path that still needs more runtime hardening.
 - `Qwen3.5-4B` now runs as a separate reward-weighted local training stack with persistent LoRA checkpoints.
-- The `Qwen3.5-4B` path is experimental and independent from the slime-based trainer.
+- The `Qwen3.5-4B` path is independent from the slime-based trainer.
 - Only one of the local model stacks should be active at a time on 2x3060 hardware.
 
 ### Switching Local Stacks
 
 ```bash
-cd /home/main/OpenClaw-RL
+cd /home/main/OpenClaw-RL-main
 ./switch-local-stack.sh qwen3
 ./switch-local-stack.sh qwen3-4b
 ./switch-local-stack.sh qwen35

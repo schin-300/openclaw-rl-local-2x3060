@@ -231,6 +231,6 @@ models/
 ckpt/
 openclaw-rl/results/
 openclaw-feedback-ui/state/
-qwen35-experimental/state/
-qwen35-experimental/__pycache__/
+qwen35-live/state/
+qwen35-live/__pycache__/
 .sglang-qwen35-overlay/
