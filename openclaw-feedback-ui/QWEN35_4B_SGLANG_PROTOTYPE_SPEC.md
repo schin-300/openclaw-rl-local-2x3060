@@ -32,6 +32,7 @@ One main chat product, not a fake desktop.
 5. Notes and settings must be compact and not feel like separate bulky windows.
 6. Browser and CLI must hit the same backend path.
 7. Long transcripts must stay responsive instead of degrading sharply as chats grow.
+8. While a reply is streaming, the user must be able to stop generation from the main composer without breaking the chat session.
 
 ## Status Update
 
@@ -70,6 +71,7 @@ As of `2026-03-22`, the requested target is live and verified locally:
    rebuilding the entire transcript on every token.
 9. Session persistence must avoid rescanning every saved chat file on each turn
    commit when the active session summary can be updated incrementally.
+10. Stopping generation should preserve any partial assistant reply already streamed instead of forcing a full app error.
 
 ## Remaining Operational Note
 
@@ -97,6 +99,7 @@ Once the backend gate is resolved:
 7. After service restart, the app returns in the same correct state.
 8. Oversized feedback does not kill the trainer service.
 9. A long multi-turn chat still streams smoothly without full-transcript jank.
+10. A streaming reply can be stopped from the UI and the partial reply remains visible in the chat.
 
 ## Decision Rule
 

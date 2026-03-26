@@ -596,6 +596,14 @@ input[type="text"] {
   background: var(--accent);
 }
 
+.send-button.stop-mode {
+  background: #c65a5a;
+}
+
+.send-button.stop-mode.stop-pending {
+  background: #a1763c;
+}
+
 .message-feedback-summary {
   line-height: 1.45;
 }

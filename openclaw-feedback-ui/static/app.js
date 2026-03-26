@@ -3,6 +3,7 @@ const state = {
   sessions: [],
   activeSessionId: "",
   busy: false,
+  stopRequested: false,
   model: "",
   backendMode: "rl_proxy",
   chatBackendMode: "rl_proxy",
@@ -20,12 +21,14 @@ const state = {
 };
 
 const feedbackDrafts = new Map();
+let activeStreamController = null;
 
 const els = {
   appShell: document.getElementById("app-shell"),
   transcript: document.getElementById("transcript"),
   emptyState: document.getElementById("empty-state"),
   sendButton: document.getElementById("send-button"),
+  sendButtonIcon: document.querySelector("#send-button .send-button-icon"),
   promptInput: document.getElementById("prompt-input"),
   systemPromptInput: document.getElementById("system-prompt-input"),
   guidanceInput: document.getElementById("guidance-input"),
@@ -228,6 +231,9 @@ function syncTranscriptBusyState() {
 
 function setBusy(isBusy) {
   state.busy = isBusy;
+  if (!isBusy) {
+    state.stopRequested = false;
+  }
   document.body.classList.toggle("busy", isBusy);
   renderControls();
   syncTranscriptBusyState();
@@ -286,6 +292,32 @@ function setStreamingMetrics(turnId, metrics = null) {
 
 function clearStreamingTurns() {
   state.transcript = state.transcript.filter((item) => !item.ephemeral);
+}
+
+function finalizeStoppedStream() {
+  const persistedTurns = state.transcript.filter((item) => !item.ephemeral);
+  const userTurn = state.transcript.find((item) => item.ephemeral && item.role === "user");
+  const assistantTurn = state.transcript.find((item) => item.ephemeral && item.role === "assistant");
+  const hasAssistantContent = Boolean(
+    assistantTurn && (String(assistantTurn.content || "").trim() || String(assistantTurn.reasoning || "").trim())
+  );
+
+  if (userTurn) {
+    persistedTurns.push({ ...userTurn, ephemeral: false });
+  }
+  if (assistantTurn && hasAssistantContent) {
+    persistedTurns.push({
+      ...assistantTurn,
+      ephemeral: false,
+      streaming: false,
+      feedback_pending: false,
+      stopped: true,
+    });
+  }
+
+  state.transcript = persistedTurns;
+  setBusy(false);
+  renderTranscript();
 }
 
 function updateProfileLabels() {
@@ -478,7 +510,22 @@ function renderStatus() {
 
 function renderControls() {
   const disabled = state.busy;
-  els.sendButton.disabled = disabled || !els.promptInput.value.trim();
+  if (state.busy) {
+    els.sendButton.disabled = state.stopRequested;
+    els.sendButton.setAttribute("aria-label", state.stopRequested ? "Stopping response" : "Stop generating");
+    els.sendButton.classList.add("stop-mode");
+    els.sendButton.classList.toggle("stop-pending", state.stopRequested);
+    if (els.sendButtonIcon) {
+      els.sendButtonIcon.textContent = state.stopRequested ? "…" : "■";
+    }
+  } else {
+    els.sendButton.disabled = !els.promptInput.value.trim();
+    els.sendButton.setAttribute("aria-label", "Send message");
+    els.sendButton.classList.remove("stop-mode", "stop-pending");
+    if (els.sendButtonIcon) {
+      els.sendButtonIcon.textContent = "➤";
+    }
+  }
   els.promptInput.disabled = disabled;
   els.systemPromptInput.disabled = disabled;
   els.guidanceInput.disabled = disabled;
@@ -594,6 +641,11 @@ function buildTranscriptMessage(item) {
     feedbackSummary.textContent = item.feedback.note
       ? `Rated ${summary} for training. Note: ${item.feedback.note}`
       : `Rated ${summary} for training.`;
+  } else if (item.stopped) {
+    feedbackControls.classList.add("hidden");
+    feedbackPill.classList.remove("hidden");
+    feedbackPill.classList.add("neutral-pill");
+    feedbackPill.textContent = "Stopped";
   } else if (item.feedback_pending !== false) {
     feedbackControls.classList.remove("hidden");
     const draft = getFeedbackDraft(item.id);
@@ -684,6 +736,7 @@ function applyProfilesState(profilePayload) {
 function applyServerState(serverState, proxyState = null, profilePayload = null) {
   state.transcript = serverState.transcript || [];
   state.busy = Boolean(serverState.busy);
+  state.stopRequested = Boolean(serverState.stop_requested) && state.busy;
   document.body.classList.toggle("busy", state.busy);
   state.model = serverState.model || "";
   state.backendMode = serverState.backend_mode || "rl_proxy";
@@ -831,12 +884,16 @@ async function sendPrompt() {
     return;
   }
 
+  state.stopRequested = false;
   setBusy(true);
+  const controller = new AbortController();
+  activeStreamController = controller;
   try {
     const response = await fetch("/api/chat/stream", {
       method: "POST",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
       body: JSON.stringify({ prompt, thinking_enabled: state.thinkingEnabled }),
     });
 
@@ -895,6 +952,10 @@ async function sendPrompt() {
       await refreshState();
     }
   } catch (error) {
+    if (error.name === "AbortError" && state.stopRequested) {
+      finalizeStoppedStream();
+      return;
+    }
     try {
       await refreshState();
     } catch (_refreshError) {
@@ -902,6 +963,29 @@ async function sendPrompt() {
     }
     window.alert(error.message);
     setBusy(false);
+  } finally {
+    if (activeStreamController === controller) {
+      activeStreamController = null;
+    }
+  }
+}
+
+async function stopPrompt() {
+  if (!state.busy || state.stopRequested) {
+    return;
+  }
+
+  state.stopRequested = true;
+  renderControls();
+  try {
+    fetch("/api/chat/stop", { method: "POST", credentials: "same-origin", keepalive: true }).catch(() => {});
+    if (activeStreamController) {
+      activeStreamController.abort();
+    }
+  } catch (error) {
+    state.stopRequested = false;
+    renderControls();
+    window.alert(error.message);
   }
 }
 
@@ -1114,7 +1198,13 @@ function closePanel(panelName) {
   syncUtilityPanels();
 }
 
-els.sendButton.addEventListener("click", sendPrompt);
+els.sendButton.addEventListener("click", () => {
+  if (state.busy) {
+    stopPrompt();
+    return;
+  }
+  sendPrompt();
+});
 els.guidanceSaveButton.addEventListener("click", saveGuidance);
 els.newSessionButton.addEventListener("click", createSession);
 if (els.thinkingToggle) {

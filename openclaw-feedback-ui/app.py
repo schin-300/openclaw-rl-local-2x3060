@@ -9,7 +9,7 @@ import time
 import uuid
 from pathlib import Path
 from threading import RLock
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 import uvicorn
@@ -463,6 +463,7 @@ def _load_state_from_session(state: dict[str, Any], profile_id: str, session_id:
     state["context_messages"] = list(session.get("context_messages") or [])
     state["feedback_candidates"] = dict(session.get("feedback_candidates") or {})
     state["busy"] = False
+    state["stream_stop_requested"] = False
     _touch_state(state)
     return session
 
@@ -475,6 +476,7 @@ def _new_browser_state(profile_id: str | None = None) -> dict[str, Any]:
         "sessions": [],
         "active_session_id": "",
         "busy": False,
+        "stream_stop_requested": False,
         "guidance_text": "",
         "system_prompt_text": "",
         "thinking_enabled": False,
@@ -494,6 +496,7 @@ def _serialize_state(state: dict[str, Any]) -> dict[str, Any]:
         "transcript": state["transcript"],
         "awaiting_feedback": awaiting_feedback,
         "busy": state["busy"],
+        "stop_requested": bool(state.get("stream_stop_requested")),
         "model": MODEL_NAME,
         "backend_mode": BACKEND_MODE,
         "chat_backend_mode": CHAT_BACKEND_MODE,
@@ -517,6 +520,12 @@ def _is_split_backend() -> bool:
 
 def _touch_state(state: dict[str, Any]) -> None:
     state["updated_at"] = time.time()
+
+
+def _is_stream_stop_requested(browser_id: str) -> bool:
+    with _state_lock:
+        state = _browser_sessions.get(browser_id)
+        return bool(state and state.get("stream_stop_requested"))
 
 
 def _persist_active_session_state(state: dict[str, Any], *, title_from_prompt: str | None = None) -> None:
@@ -1079,6 +1088,7 @@ async def _proxy_chat_stream(
     session_done: bool,
     thinking_enabled: bool,
     max_tokens: int | None = None,
+    stop_checker: Callable[[], bool] | None = None,
 ):
     backend_label = _chat_backend_label()
     headers = {
@@ -1113,7 +1123,16 @@ async def _proxy_chat_stream(
                             )
                         raise HTTPException(status_code=502, detail=f"{backend_label} error {response.status_code}: {detail}")
 
-                    async for raw_payload in _aiter_sse_payloads(response):
+                    payload_iter = _aiter_sse_payloads(response).__aiter__()
+                    while True:
+                        if stop_checker is not None and stop_checker():
+                            return
+                        try:
+                            raw_payload = await asyncio.wait_for(payload_iter.__anext__(), timeout=0.25)
+                        except asyncio.TimeoutError:
+                            continue
+                        except StopAsyncIteration:
+                            break
                         if raw_payload == "[DONE]":
                             break
                         try:
@@ -1616,6 +1635,7 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
         if state["busy"]:
             raise HTTPException(status_code=409, detail="Another request is already running")
         state["busy"] = True
+        state["stream_stop_requested"] = False
         context_messages = list(state["context_messages"])
         guidance_text = state.get("guidance_text", "")
         system_prompt_text = state.get("system_prompt_text", "")
@@ -1665,6 +1685,7 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
 
     async def event_stream():
         committed = False
+        stop_requested = False
         final_text = ""
         final_reasoning = ""
         last_metrics: dict[str, Any] | None = None
@@ -1691,9 +1712,14 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
                 session_done=False,
                 thinking_enabled=thinking_enabled,
                 max_tokens=requested_max_tokens,
+                stop_checker=lambda: _is_stream_stop_requested(browser_id),
             ):
                 if await request.is_disconnected():
                     raise asyncio.CancelledError()
+                if _is_stream_stop_requested(browser_id):
+                    stop_requested = True
+                    finish_reason = "stop"
+                    break
 
                 if event["type"] == "delta":
                     raw_metrics = event.get("metrics") or {}
@@ -1747,6 +1773,7 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
                         first_token_at=first_token_at,
                     )
 
+            stop_requested = stop_requested or _is_stream_stop_requested(browser_id)
             if structured_visible_thinking:
                 assistant_reasoning, assistant_text = _split_visible_thinking_response(streamed_raw_text, final=True)
                 assistant_reasoning = assistant_reasoning.strip()
@@ -1755,7 +1782,7 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
                 assistant_reasoning = final_reasoning.strip()
                 assistant_text = _resolve_assistant_text(final_text, assistant_reasoning)
             needs_reasoning_backfill = structured_visible_thinking and bool(assistant_text) and not assistant_reasoning
-            if needs_reasoning_backfill or (not assistant_text and not assistant_reasoning):
+            if not stop_requested and (needs_reasoning_backfill or (not assistant_text and not assistant_reasoning)):
                 fallback_response = await _proxy_chat(
                     messages=prompt_messages,
                     session_id=training_session_id,
@@ -1802,6 +1829,17 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
                         },
                     )
 
+            if stop_requested and not assistant_text and not assistant_reasoning:
+                with _state_lock:
+                    state = _browser_sessions[browser_id]
+                    state["busy"] = False
+                    state["stream_stop_requested"] = False
+                    _touch_state(state)
+                    serialized_state = _serialize_state(state)
+                committed = True
+                yield _sse_event("state", {"state": serialized_state})
+                return
+
             if not assistant_text and not assistant_reasoning:
                 raise HTTPException(status_code=502, detail="Model returned an empty response")
 
@@ -1843,6 +1881,7 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
                     guidance_text=guidance_text,
                 )
                 state["busy"] = False
+                state["stream_stop_requested"] = False
                 _touch_state(state)
                 serialized_state = _serialize_state(state)
 
@@ -1852,12 +1891,14 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
             with _state_lock:
                 state = _browser_sessions[browser_id]
                 state["busy"] = False
+                state["stream_stop_requested"] = False
                 _touch_state(state)
             raise
         except Exception as exc:
             with _state_lock:
                 state = _browser_sessions[browser_id]
                 state["busy"] = False
+                state["stream_stop_requested"] = False
                 _touch_state(state)
             detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
             yield _sse_event("error", {"detail": detail or "Streaming failed"})
@@ -1866,6 +1907,7 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
                 with _state_lock:
                     state = _browser_sessions[browser_id]
                     state["busy"] = False
+                    state["stream_stop_requested"] = False
                     _touch_state(state)
 
     response = StreamingResponse(
@@ -1879,6 +1921,22 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
     )
     _set_cookie_on_response(response, browser_id, created)
     return response
+
+
+@app.post("/api/chat/stop")
+async def api_chat_stop(request: Request) -> JSONResponse:
+    browser_id, _, created = _ensure_browser_session(request)
+    with _state_lock:
+        state = _browser_sessions[browser_id]
+        if state["busy"]:
+            state["stream_stop_requested"] = True
+        _touch_state(state)
+        payload = {
+            "ok": True,
+            "stop_requested": bool(state["busy"]),
+            "state": _serialize_state(state),
+        }
+    return _response_with_cookie(payload, browser_id, created)
 
 
 @app.post("/api/chat")
