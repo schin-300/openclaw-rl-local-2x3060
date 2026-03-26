@@ -221,8 +221,8 @@ Shell state must never wipe app state unnecessarily when switching apps.
 After the OS shell is working, add two focused apps:
 
 1. `Heretic Chat`
-   A simple chat app dedicated to the specific
-   `llmfan46/Qwen3.5-27B-heretic-v3-Q4_K_M.gguf` model path.
+   A simple chat app dedicated to the exact model artifact:
+   `https://huggingface.co/llmfan46/Qwen3.5-27B-heretic-v3-GGUF?show_file_info=Qwen3.5-27B-heretic-v3-Q4_K_M.gguf`
 2. `Model Control`
    A minimal control app for switching the `2x3060` GPUs between:
    - the current `OpenClaw RL` runtime
@@ -239,6 +239,24 @@ When Phase 4 starts:
 2. `Model Control` must present a single obvious mode switch for GPU ownership.
 3. The shell must make it clear which model lane is currently active.
 4. GPU switching should prioritize clarity and safety over cleverness.
+5. `Heretic Chat` should stay intentionally simple at first:
+   one transcript, one composer, one clear model label, no RL controls.
+6. `Model Control` should expose only two GPU modes:
+   `OpenClaw RL` or `Heretic Chat`.
+7. The selected GPU mode should be visible from both the `Model Control` app
+   and the shell-level status area.
+8. Switching modes should clearly communicate that the same `2x3060` GPUs are
+   being reassigned from one runtime to the other, not shared invisibly.
+
+## Phase 4 Acceptance
+
+1. `Heretic Chat` opens as its own app inside `OpenClaw OS`.
+2. `Heretic Chat` is wired to the exact Heretic `Q4_K_M.gguf` target above.
+3. `Model Control` can switch the machine between `OpenClaw RL` mode and
+   `Heretic Chat` mode.
+4. The active mode is truthful in the UI and survives reload.
+5. Attempting to use the inactive model lane should fail clearly, not
+   ambiguously.
 
 ## Eval Checklist
 
