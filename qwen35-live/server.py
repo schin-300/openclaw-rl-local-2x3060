@@ -39,6 +39,7 @@ SERVED_MODEL_NAME = os.environ.get("QWEN35_SERVED_MODEL_NAME", "qwen3.5-4b-local
 HOST = os.environ.get("QWEN35_HOST", "127.0.0.1")
 PORT = int(os.environ.get("QWEN35_PORT", "30100"))
 MAX_INPUT_TOKENS = int(os.environ.get("QWEN35_MAX_INPUT_TOKENS", "2048"))
+TRAIN_MAX_INPUT_TOKENS = int(os.environ.get("QWEN35_TRAIN_MAX_INPUT_TOKENS", str(MAX_INPUT_TOKENS)))
 DEFAULT_MAX_NEW_TOKENS = int(os.environ.get("QWEN35_DEFAULT_MAX_NEW_TOKENS", "192"))
 DEFAULT_TEMPERATURE = float(os.environ.get("QWEN35_DEFAULT_TEMPERATURE", "0.6"))
 DEFAULT_TOP_P = float(os.environ.get("QWEN35_DEFAULT_TOP_P", "0.9"))
@@ -962,8 +963,8 @@ def _build_training_tensors(
 
     train_ids = torch.cat([prompt_ids, response_ids], dim=0)
     assistant_start = int(prompt_ids.shape[0])
-    if train_ids.shape[0] > MAX_INPUT_TOKENS:
-        overflow = int(train_ids.shape[0] - MAX_INPUT_TOKENS)
+    if train_ids.shape[0] > TRAIN_MAX_INPUT_TOKENS:
+        overflow = int(train_ids.shape[0] - TRAIN_MAX_INPUT_TOKENS)
         train_ids = train_ids[overflow:]
         assistant_start = max(0, assistant_start - overflow)
     if assistant_start >= train_ids.shape[0]:
@@ -1416,24 +1417,38 @@ def _train_on_feedback(body: dict[str, Any]) -> dict[str, Any]:
         updated = False
 
         if abs(reward) > 1e-9:
-            _model.train()
-            _optimizer.zero_grad(set_to_none=True)
-            outputs = _model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                use_cache=False,
-            )
-            ce_loss = outputs.loss
-            objective = ce_loss * reward
-            objective.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                [param for param in _model.parameters() if param.requires_grad],
-                TRAIN_CLIP_NORM,
-            )
-            _optimizer.step()
-            _optimizer.zero_grad(set_to_none=True)
-            _model.eval()
+            try:
+                _model.train()
+                _optimizer.zero_grad(set_to_none=True)
+                outputs = _model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    use_cache=False,
+                )
+                ce_loss = outputs.loss
+                objective = ce_loss * reward
+                objective.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    [param for param in _model.parameters() if param.requires_grad],
+                    TRAIN_CLIP_NORM,
+                )
+                _optimizer.step()
+                _optimizer.zero_grad(set_to_none=True)
+                _model.eval()
+            except torch.OutOfMemoryError as exc:
+                _optimizer.zero_grad(set_to_none=True)
+                _model.eval()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Training ran out of GPU memory. The trainer stayed online, "
+                        "but this feedback sample was too large for live updates."
+                    ),
+                ) from exc
 
             ce_loss_value = float(ce_loss.detach().cpu().item())
             objective_value = float(objective.detach().cpu().item())
@@ -1521,6 +1536,7 @@ def health() -> JSONResponse:
         "model_id": MODEL_ID,
         "load_in_4bit": LOAD_IN_4BIT,
         "max_input_tokens": MAX_INPUT_TOKENS,
+        "train_max_input_tokens": TRAIN_MAX_INPUT_TOKENS,
         "default_max_new_tokens": DEFAULT_MAX_NEW_TOKENS,
         "train_max_response_tokens": TRAIN_MAX_RESPONSE_TOKENS,
         "loaded_at": _loaded_at,

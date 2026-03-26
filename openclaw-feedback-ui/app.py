@@ -365,6 +365,24 @@ def _session_summary(session: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _upsert_session_summary(
+    sessions: list[dict[str, Any]] | None,
+    session: dict[str, Any],
+) -> list[dict[str, Any]]:
+    summary = _session_summary(session)
+    next_sessions = [
+        item
+        for item in (sessions or [])
+        if str(item.get("id") or "").strip() != summary["id"]
+    ]
+    next_sessions.append(summary)
+    next_sessions.sort(
+        key=lambda item: (float(item.get("updated_at") or 0), float(item.get("created_at") or 0)),
+        reverse=True,
+    )
+    return next_sessions
+
+
 def _list_profile_sessions(profile_id: str) -> list[dict[str, Any]]:
     sessions_dir = _profile_sessions_dir(profile_id)
     if not sessions_dir.exists():
@@ -517,9 +535,9 @@ def _persist_active_session_state(state: dict[str, Any], *, title_from_prompt: s
     session["updated_at"] = time.time()
     if title_from_prompt and not had_user_messages:
         session["title"] = _session_title_from_prompt(title_from_prompt)
-    _save_session_record(profile_id, session)
+    saved_session = _save_session_record(profile_id, session)
     _save_profile_active_session_id(profile_id, session_id)
-    state["sessions"] = _list_profile_sessions(profile_id)
+    state["sessions"] = _upsert_session_summary(state.get("sessions"), saved_session)
     _touch_state(state)
 
 
@@ -1239,6 +1257,31 @@ def _augment_profile_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return augmented
 
 
+def _fallback_profile_payload() -> dict[str, Any]:
+    _ensure_profile_storage()
+    profile_ids = []
+    if PROFILES_DIR.exists():
+        for child in sorted(PROFILES_DIR.iterdir(), key=lambda item: item.name):
+            if child.is_dir():
+                profile_ids.append(child.name)
+    if not profile_ids:
+        profile_ids = [DEFAULT_PROFILE_ID]
+    return _augment_profile_payload(
+        {
+            "ok": False,
+            "active_profile_id": _load_active_profile_id(),
+            "profiles": [
+                {
+                    "id": profile_id,
+                    "name": profile_id,
+                    "size_bytes": 0,
+                }
+                for profile_id in profile_ids
+            ],
+        }
+    )
+
+
 def _save_profile_text_settings(
     profile_id: str,
     *,
@@ -1269,8 +1312,10 @@ async def _proxy_profiles() -> dict[str, Any]:
         try:
             response = await client.get(PROFILES_URL, headers=headers)
         except httpx.HTTPError as exc:
-            raise HTTPException(status_code=502, detail=f"Profile backend connection error: {exc}") from exc
+            return _fallback_profile_payload()
     if response.status_code != 200:
+        if response.status_code >= 500:
+            return _fallback_profile_payload()
         raise HTTPException(status_code=502, detail=f"Profile backend error {response.status_code}: {response.text[:1200]}")
     try:
         payload = response.json()

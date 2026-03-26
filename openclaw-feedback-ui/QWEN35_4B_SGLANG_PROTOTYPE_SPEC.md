@@ -31,6 +31,7 @@ One main chat product, not a fake desktop.
 4. Thinking toggle must actually change request behavior/state.
 5. Notes and settings must be compact and not feel like separate bulky windows.
 6. Browser and CLI must hit the same backend path.
+7. Long transcripts must stay responsive instead of degrading sharply as chats grow.
 
 ## Status Update
 
@@ -58,6 +59,17 @@ As of `2026-03-22`, the requested target is live and verified locally:
    wrapper.
 5. The Notes and Profiles controls stay as compact integrated panels inside the
    same chat surface.
+6. Long-context chat and live RL training must use separate safety budgets:
+   SGLang chat may run with a larger context and reply cap, while the trainer
+   must keep a smaller training window so feedback updates do not crash the
+   local GPU process.
+7. Trainer OOM during feedback must fail gracefully without taking the trainer
+   service down, and the profiles panel must still open even if the trainer is
+   briefly warming back up.
+8. Streaming updates must patch only the active turn in the browser instead of
+   rebuilding the entire transcript on every token.
+9. Session persistence must avoid rescanning every saved chat file on each turn
+   commit when the active session summary can be updated incrementally.
 
 ## Remaining Operational Note
 
@@ -83,6 +95,8 @@ Once the backend gate is resolved:
 5. Notes/settings are compact and usable without leaving the main chat flow.
 6. CLI and browser both hit the same live backend.
 7. After service restart, the app returns in the same correct state.
+8. Oversized feedback does not kill the trainer service.
+9. A long multi-turn chat still streams smoothly without full-transcript jank.
 
 ## Decision Rule
 

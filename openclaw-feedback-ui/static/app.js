@@ -198,23 +198,49 @@ function autoResizeComposer() {
   els.promptInput.style.height = `${nextHeight}px`;
 }
 
+function isTranscriptNearBottom() {
+  if (!els.transcript) {
+    return true;
+  }
+  const threshold = 96;
+  const distanceFromBottom =
+    els.transcript.scrollHeight - els.transcript.scrollTop - els.transcript.clientHeight;
+  return distanceFromBottom <= threshold;
+}
+
+function scrollTranscriptToBottom() {
+  if (els.transcript) {
+    els.transcript.scrollTop = els.transcript.scrollHeight;
+  }
+}
+
+function syncTranscriptBusyState() {
+  if (!els.transcript) {
+    return;
+  }
+  for (const input of els.transcript.querySelectorAll(".message-feedback-input")) {
+    input.disabled = state.busy;
+  }
+  for (const button of els.transcript.querySelectorAll(".message-feedback-send, .score-pill")) {
+    button.disabled = state.busy;
+  }
+}
+
 function setBusy(isBusy) {
   state.busy = isBusy;
   document.body.classList.toggle("busy", isBusy);
   renderControls();
-  renderTranscript();
+  syncTranscriptBusyState();
   renderSessions();
 }
 
 function upsertStreamingTurn(turn) {
   const existingIndex = state.transcript.findIndex((item) => item.id === turn.id);
   if (existingIndex === -1) {
-    state.transcript = [...state.transcript, turn];
+    state.transcript.push(turn);
     return;
   }
-  const nextTranscript = [...state.transcript];
-  nextTranscript[existingIndex] = { ...nextTranscript[existingIndex], ...turn };
-  state.transcript = nextTranscript;
+  Object.assign(state.transcript[existingIndex], turn);
 }
 
 function hasStreamMetrics(metrics) {
@@ -226,19 +252,17 @@ function appendStreamingDelta(turnId, delta, reasoningDelta = "", metrics = null
   if (existingIndex === -1) {
     return;
   }
-  const nextTranscript = [...state.transcript];
-  const current = nextTranscript[existingIndex];
+  const current = state.transcript[existingIndex];
   const nextMetrics = hasStreamMetrics(metrics)
     ? { ...(current.metrics && typeof current.metrics === "object" ? current.metrics : {}), ...metrics }
     : current.metrics || null;
-  nextTranscript[existingIndex] = {
+  state.transcript[existingIndex] = {
     ...current,
     content: `${current.content || ""}${delta || ""}`,
     reasoning: `${current.reasoning || ""}${reasoningDelta || ""}`,
     metrics: nextMetrics,
     streaming: true,
   };
-  state.transcript = nextTranscript;
 }
 
 function setStreamingMetrics(turnId, metrics = null) {
@@ -249,17 +273,15 @@ function setStreamingMetrics(turnId, metrics = null) {
   if (existingIndex === -1) {
     return;
   }
-  const nextTranscript = [...state.transcript];
-  nextTranscript[existingIndex] = {
-    ...nextTranscript[existingIndex],
+  state.transcript[existingIndex] = {
+    ...state.transcript[existingIndex],
     metrics: {
-      ...(nextTranscript[existingIndex].metrics && typeof nextTranscript[existingIndex].metrics === "object"
-        ? nextTranscript[existingIndex].metrics
+      ...(state.transcript[existingIndex].metrics && typeof state.transcript[existingIndex].metrics === "object"
+        ? state.transcript[existingIndex].metrics
         : {}),
       ...metrics,
     },
   };
-  state.transcript = nextTranscript;
 }
 
 function clearStreamingTurns() {
@@ -510,108 +532,141 @@ function renderMessageMetrics(message, item) {
   speed.textContent = Number.isFinite(tokensPerSecond) && tokensPerSecond > 0 ? `${tokensPerSecond.toFixed(1)} tok/s` : "";
 }
 
+function buildTranscriptMessage(item) {
+  const fragment = els.messageTemplate.content.cloneNode(true);
+  const message = fragment.querySelector(".message");
+  const roleLabel = message.querySelector(".role-label");
+  const body = message.querySelector(".message-body");
+  const feedbackPill = message.querySelector(".feedback-pill");
+  const reasoningBlock = message.querySelector(".reasoning-block");
+  const reasoningBody = message.querySelector(".reasoning-body");
+  const feedbackControls = message.querySelector(".message-feedback-controls");
+  const scorePills = message.querySelector(".message-score-pills");
+  const scoreSummary = message.querySelector(".message-rating-summary");
+  const feedbackInput = message.querySelector(".message-feedback-input");
+  const feedbackSendButton = message.querySelector(".message-feedback-send");
+  const feedbackSummary = message.querySelector(".message-feedback-summary");
+
+  message.classList.add(item.role === "assistant" ? "assistant-message" : "user-message");
+  if (item.id) {
+    message.dataset.messageId = item.id;
+  }
+  if (item.role === "assistant") {
+    message.dataset.turnId = item.id || "";
+  }
+  if (item.streaming) {
+    message.classList.add("streaming-message");
+  }
+
+  roleLabel.textContent = item.role === "assistant" ? "Assistant" : "You";
+  const displayContent = getDisplayMessageContent(item);
+  if (item.role === "assistant" && !displayContent && item.reasoning) {
+    if (item.streaming) {
+      body.innerHTML = "";
+    } else {
+      body.innerHTML = '<p class="assistant-placeholder-copy">Final answer missing. Open Thinking to inspect the reasoning trace.</p>';
+    }
+  } else {
+    body.innerHTML = renderMarkdownLite(displayContent);
+  }
+
+  if (item.reasoning) {
+    reasoningBlock.classList.remove("hidden");
+    reasoningBlock.open = Boolean(item.streaming);
+    reasoningBody.textContent = item.reasoning;
+  }
+
+  renderMessageMetrics(message, item);
+
+  if (item.role !== "assistant") {
+    feedbackControls.classList.add("hidden");
+  } else if (item.streaming) {
+    feedbackControls.classList.add("hidden");
+    feedbackPill.classList.remove("hidden");
+    feedbackPill.classList.add("neutral-pill");
+    feedbackPill.textContent = "Streaming";
+  } else if (item.feedback) {
+    const summary = getFeedbackSummary(item.feedback);
+    feedbackPill.classList.remove("hidden");
+    feedbackPill.classList.add("good-pill");
+    feedbackPill.textContent = summary;
+    feedbackSummary.classList.remove("hidden");
+    feedbackSummary.textContent = item.feedback.note
+      ? `Rated ${summary} for training. Note: ${item.feedback.note}`
+      : `Rated ${summary} for training.`;
+  } else if (item.feedback_pending !== false) {
+    feedbackControls.classList.remove("hidden");
+    const draft = getFeedbackDraft(item.id);
+    scoreSummary.textContent = draft.score ? `Current score: ${draft.score}/10` : "Choose a score from 1 to 10";
+    feedbackInput.value = draft.note;
+    feedbackInput.disabled = state.busy;
+    feedbackSendButton.disabled = state.busy || !draft.score;
+
+    for (let score = 1; score <= 10; score += 1) {
+      const button = document.createElement("button");
+      button.className = "score-pill";
+      button.type = "button";
+      button.textContent = String(score);
+      button.classList.toggle("selected", draft.score === score);
+      button.disabled = state.busy;
+      button.addEventListener("click", () => {
+        const nextDraft = getFeedbackDraft(item.id);
+        nextDraft.score = nextDraft.score === score ? null : score;
+        patchTranscriptTurn(item.id);
+      });
+      scorePills.appendChild(button);
+    }
+
+    feedbackInput.addEventListener("input", (event) => {
+      getFeedbackDraft(item.id).note = event.target.value;
+    });
+
+    feedbackSendButton.addEventListener("click", () => {
+      sendFeedback(item.id);
+    });
+  } else {
+    feedbackControls.classList.add("hidden");
+  }
+
+  return message;
+}
+
+function patchTranscriptTurn(turnId) {
+  if (!turnId || !els.transcript) {
+    renderTranscript();
+    return;
+  }
+  const item = state.transcript.find((entry) => entry.id === turnId);
+  if (!item) {
+    renderTranscript();
+    return;
+  }
+  const selector = `.message[data-message-id="${window.CSS && typeof window.CSS.escape === "function" ? window.CSS.escape(turnId) : turnId}"]`;
+  const existing = els.transcript.querySelector(selector);
+  if (!existing) {
+    renderTranscript();
+    return;
+  }
+  const shouldStick = isTranscriptNearBottom();
+  existing.replaceWith(buildTranscriptMessage(item));
+  if (shouldStick) {
+    scrollTranscriptToBottom();
+  }
+}
+
 function renderTranscript() {
+  const shouldStick = !els.transcript.childElementCount || isTranscriptNearBottom();
   els.transcript.innerHTML = "";
   const hasMessages = state.transcript.length > 0;
   els.emptyState.classList.toggle("hidden", hasMessages);
 
   for (const item of state.transcript) {
-    const fragment = els.messageTemplate.content.cloneNode(true);
-    const message = fragment.querySelector(".message");
-    const roleLabel = fragment.querySelector(".role-label");
-    const body = fragment.querySelector(".message-body");
-    const feedbackPill = fragment.querySelector(".feedback-pill");
-    const reasoningBlock = fragment.querySelector(".reasoning-block");
-    const reasoningBody = fragment.querySelector(".reasoning-body");
-    const feedbackControls = fragment.querySelector(".message-feedback-controls");
-    const scorePills = fragment.querySelector(".message-score-pills");
-    const scoreSummary = fragment.querySelector(".message-rating-summary");
-    const feedbackInput = fragment.querySelector(".message-feedback-input");
-    const feedbackSendButton = fragment.querySelector(".message-feedback-send");
-    const feedbackSummary = fragment.querySelector(".message-feedback-summary");
-
-    message.classList.add(item.role === "assistant" ? "assistant-message" : "user-message");
-    if (item.role === "assistant") {
-      message.dataset.turnId = item.id || "";
-    }
-    if (item.streaming) {
-      message.classList.add("streaming-message");
-    }
-
-    roleLabel.textContent = item.role === "assistant" ? "Assistant" : "You";
-    const displayContent = getDisplayMessageContent(item);
-    if (item.role === "assistant" && !displayContent && item.reasoning) {
-      if (item.streaming) {
-        body.innerHTML = "";
-      } else {
-        body.innerHTML = '<p class="assistant-placeholder-copy">Final answer missing. Open Thinking to inspect the reasoning trace.</p>';
-      }
-    } else {
-      body.innerHTML = renderMarkdownLite(displayContent);
-    }
-
-    if (item.reasoning) {
-      reasoningBlock.classList.remove("hidden");
-      reasoningBlock.open = Boolean(item.streaming);
-      reasoningBody.textContent = item.reasoning;
-    }
-
-    renderMessageMetrics(fragment, item);
-
-    if (item.role !== "assistant") {
-      feedbackControls.classList.add("hidden");
-    } else if (item.streaming) {
-      feedbackControls.classList.add("hidden");
-      feedbackPill.classList.remove("hidden");
-      feedbackPill.classList.add("neutral-pill");
-      feedbackPill.textContent = "Streaming";
-    } else if (item.feedback) {
-      const summary = getFeedbackSummary(item.feedback);
-      feedbackPill.classList.remove("hidden");
-      feedbackPill.classList.add("good-pill");
-      feedbackPill.textContent = summary;
-      feedbackSummary.classList.remove("hidden");
-      feedbackSummary.textContent = item.feedback.note
-        ? `Rated ${summary} for training. Note: ${item.feedback.note}`
-        : `Rated ${summary} for training.`;
-    } else if (item.feedback_pending !== false) {
-      feedbackControls.classList.remove("hidden");
-      const draft = getFeedbackDraft(item.id);
-      scoreSummary.textContent = draft.score ? `Current score: ${draft.score}/10` : "Choose a score from 1 to 10";
-      feedbackInput.value = draft.note;
-      feedbackInput.disabled = state.busy;
-      feedbackSendButton.disabled = state.busy || !draft.score;
-
-      for (let score = 1; score <= 10; score += 1) {
-        const button = document.createElement("button");
-        button.className = "score-pill";
-        button.type = "button";
-        button.textContent = String(score);
-        button.classList.toggle("selected", draft.score === score);
-        button.disabled = state.busy;
-        button.addEventListener("click", () => {
-          const nextDraft = getFeedbackDraft(item.id);
-          nextDraft.score = nextDraft.score === score ? null : score;
-          renderTranscript();
-        });
-        scorePills.appendChild(button);
-      }
-
-      feedbackInput.addEventListener("input", (event) => {
-        getFeedbackDraft(item.id).note = event.target.value;
-      });
-
-      feedbackSendButton.addEventListener("click", () => {
-        sendFeedback(item.id);
-      });
-    } else {
-      feedbackControls.classList.add("hidden");
-    }
-
-    els.transcript.appendChild(fragment);
+    els.transcript.appendChild(buildTranscriptMessage(item));
   }
 
-  els.transcript.scrollTop = els.transcript.scrollHeight;
+  if (shouldStick) {
+    scrollTranscriptToBottom();
+  }
 }
 
 function applyProfilesState(profilePayload) {
@@ -814,13 +869,13 @@ async function sendPrompt() {
           payload.reasoning_delta || "",
           payload.metrics || null
         );
-        renderTranscript();
+        patchTranscriptTurn(payload.assistant_turn_id);
         return;
       }
 
       if (eventName === "final") {
         setStreamingMetrics(payload.assistant_turn_id, payload.metrics || null);
-        renderTranscript();
+        patchTranscriptTurn(payload.assistant_turn_id);
         return;
       }
 
