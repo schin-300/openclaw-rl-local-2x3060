@@ -1,44 +1,81 @@
-# Mainline Parity + SGLang Spec
+# Live RL Prototype Spec
 
-## Goal
+## Product Goal
 
-Bring the ChatGPT-parity UI experiment onto the stable `main` branch while keeping
-`main` on the existing OpenClaw-RL runtime path that already uses SGLang for
-serving.
+Ship one clean first prototype of the local live RL app:
 
-## Why
+- ChatGPT-style chat UI
+- `Qwen3.5-4B`
+- streaming replies
+- thinking toggle
+- compact notes and profile controls
+- browser UI and CLI talking to the same backend
 
-- The parity branch contains the stronger chat-first layout and parity docs.
-- The stable `main` branch is the better landing zone for daily use.
-- The stable OpenClaw-RL path already speaks to SGLang-backed services.
-- Replacing the experimental Qwen3.5 trainer server with SGLang in the same
-  change would add unnecessary risk and mix two different migrations.
+## Runtime Goal
 
-## In Scope
+The target runtime is `Qwen3.5-4B` served through `SGLang`.
 
-- Merge the ChatGPT-parity UI assets and docs into `main`.
-- Preserve the stable `main` behavior around sessions, thinking toggle, and
-  inline feedback.
-- Keep the default `main` runtime model on the existing `rl_proxy` /
-  SGLang-backed flow.
-- Keep the Qwen3.5 experimental server improvements that are safe to merge as
-  part of the branch history.
+Hard rule:
 
-## Out of Scope
+- Never claim the app is using `SGLang` unless the live backend health check
+  confirms it.
 
-- Rewriting the Qwen3.5 experimental trainer server to use SGLang internally.
-- Switching the stable stack to vLLM or llama.cpp.
-- Changing the live service topology beyond what `main` already uses.
+## UI Requirements
 
-## Acceptance Criteria
+- The app is one focused chat surface, not a fake desktop.
+- Chats stay in the left rail, transcript in the center, composer at the
+  bottom.
+- Notes and profile controls open as compact integrated panels instead of
+  separate fake apps or bulky tabs.
+- The header must show the real connected model and backend health.
+- Thinking output must stay in the thinking area instead of polluting the main
+  assistant answer.
 
-- `main` contains the parity branch UI layout and supporting docs.
-- The stable `main` UI still works against the SGLang-backed OpenClaw-RL stack.
-- No existing profile/session/thinking-toggle behavior on `main` regresses.
-- Qwen3.5 experimental files still load cleanly after the merge.
+## Runtime Requirements
 
-## Runtime Decision
+- Active model must be `Qwen/Qwen3.5-4B`.
+- Streaming must work end to end in the browser.
+- Thinking toggle must persist and affect requests.
+- Browser and CLI must hit the same local API path.
+- Session state, notes, and profile state must persist across restart.
 
-Use SGLang as the mainline serving path because OpenClaw-RL already integrates
-with it directly. Keep vLLM and llama.cpp as sidecar runtime options outside the
-mainline UI merge.
+## Eval Checklist
+
+The prototype only passes when all of these are true:
+
+1. `/api/status` reports `qwen3.5-4b-local` and a healthy backend.
+2. The UI streams a real reply in the browser.
+3. Thinking toggle changes the request path and renders reasoning cleanly.
+4. Notes and profiles are available without fake desktop chrome or wasted space.
+5. The model label and backend status text are truthful.
+6. The CLI can send a real prompt through the same app API.
+7. Restarting the services preserves the working state.
+
+## Current Status
+
+As of `2026-03-22`, the live prototype is running on:
+
+- `Qwen/Qwen3.5-4B`
+- `SGLang` on `http://127.0.0.1:30101`
+- trainer/control plane on `http://127.0.0.1:30100`
+- ChatGPT-style UI on `http://127.0.0.1:30001`
+
+Implementation notes:
+
+- SGLang needed a local `qwen3_5.py` LoRA shape fix so the live adapter could
+  load correctly for `Qwen3.5-4B`.
+- The UI now only requests separated reasoning from SGLang when native chat
+  thinking is actually enabled.
+- The streaming path has an empty-stream rescue that falls back to the
+  non-stream call when SGLang finishes a turn without usable visible tokens.
+- Thinking-mode streaming has a reasoning backfill pass so the Thinking panel
+  still gets content when the streamed answer lands without the expected
+  structured wrapper.
+- The transcript no longer flashes the misleading “Final answer missing” copy
+  while a thinking-mode turn is still streaming.
+
+## Residual Rule
+
+If the `SGLang` worker is still warming or restarting, do not count that as a
+passing eval run. Wait for `/api/status` to show the chat proxy healthy before
+judging browser behavior.

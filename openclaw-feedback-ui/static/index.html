@@ -3,131 +3,90 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>OpenClaw Local Feedback UI</title>
+    <title>OpenClaw Live RL Chat</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260319n" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260321a" />
   </head>
   <body>
-    <div class="desktop-shell">
-      <div class="desktop-ambience" aria-hidden="true">
-        <div class="aurora aurora-one"></div>
-        <div class="aurora aurora-two"></div>
-        <div class="aurora aurora-three"></div>
-        <div class="light-orb orb-one"></div>
-        <div class="light-orb orb-two"></div>
-      </div>
-
-      <aside class="desktop-icons" aria-label="Desktop apps">
-        <button class="desktop-icon active" data-app-launch="chat" type="button">
-          <span class="desktop-icon-glyph"></span>
-          <span>local-chat.exe</span>
-        </button>
-        <button class="desktop-icon" data-app-launch="notes" type="button">
-          <span class="desktop-icon-glyph notes-glyph"></span>
-          <span>notes.txt</span>
-        </button>
-        <button class="desktop-icon" data-app-launch="settings" type="button">
-          <span class="desktop-icon-glyph trainer-glyph"></span>
-          <span>settings.cpl</span>
-        </button>
-      </aside>
-
-      <main class="desktop-stage" id="desktop-stage">
-        <section class="app-window chat-window window-hidden" data-window="chat">
-          <header class="window-titlebar">
-            <div class="window-brand">
-              <div class="window-orb" aria-hidden="true"></div>
-              <div class="brand-copy">
-                <p class="eyebrow" id="window-model-eyebrow">CONNECTED MODEL</p>
-                <h1 id="window-model-title">Local Chat</h1>
-              </div>
-            </div>
-            <div class="titlebar-meta">
-              <div class="status-chip" id="proxy-status">Checking trainer...</div>
-              <div class="model-pill" id="model-label">Model</div>
-              <button class="thinking-toggle" id="thinking-toggle" type="button" aria-pressed="false">
-                Thinking off
-              </button>
-              <div class="model-pill profile-pill" id="chat-active-profile">Default</div>
-              <div class="window-controls">
-                <button
-                  class="window-control close-control"
-                  data-window-action="close"
-                  data-target-window="chat"
-                  type="button"
-                  aria-label="Close local chat"
-                ></button>
-              </div>
-            </div>
-          </header>
-
-          <div class="chat-layout">
-            <aside class="chat-sidebar">
-              <div class="sidebar-head">
-                <h2>Chats</h2>
-                <button class="new-chat-button" id="new-session-button" type="button">+ New chat</button>
-              </div>
-              <div class="session-list" id="session-list"></div>
-              <div class="sessions-empty hidden" id="sessions-empty">
-                Start a new chat to create the first saved conversation for this profile.
-              </div>
-              <div class="sidebar-footer">
-                <button class="sidebar-utility-button" data-open-app="notes" type="button">Notes</button>
-                <button class="sidebar-utility-button" data-open-app="settings" type="button">Settings</button>
-              </div>
-            </aside>
-
-            <section class="chat-main">
-              <section class="transcript-shell">
-                <div class="transcript" id="transcript"></div>
-                <div class="empty-state" id="empty-state">
-                  <div class="empty-orb" aria-hidden="true"></div>
-                  <h2>Train the local model like a normal chat.</h2>
-                  <p>
-                    Send messages naturally, let responses stream in live, then rate only the replies that are worth
-                    training on.
-                  </p>
-                </div>
-              </section>
-
-              <section class="composer-shell">
-                <div class="composer-frame">
-                  <textarea id="prompt-input" rows="1" placeholder="Ask anything..."></textarea>
-                  <button class="send-button" id="send-button" type="button" aria-label="Send message">
-                    <span class="send-button-icon" aria-hidden="true">&#10148;</span>
-                  </button>
-                </div>
-              </section>
-            </section>
+    <div class="app-shell" id="app-shell">
+      <header class="app-header">
+        <div class="window-brand">
+          <div class="window-orb" aria-hidden="true"></div>
+          <div class="brand-copy">
+            <p class="eyebrow" id="window-model-eyebrow">CONNECTED MODEL</p>
+            <h1 id="window-model-title">OpenClaw Live RL Chat</h1>
           </div>
-        </section>
+        </div>
+        <div class="titlebar-meta">
+          <div class="status-chip" id="proxy-status">Checking trainer...</div>
+          <div class="model-pill" id="model-label">Model</div>
+          <button class="thinking-toggle" id="thinking-toggle" type="button" aria-pressed="false">Thinking off</button>
+          <div class="model-pill profile-pill" id="chat-active-profile">Default</div>
+          <div class="header-utility-actions">
+            <button class="header-utility-button mobile-only" data-panel-toggle="notes" type="button">Notes</button>
+            <button class="header-utility-button mobile-only" data-panel-toggle="settings" type="button">Profiles</button>
+          </div>
+        </div>
+      </header>
 
-        <section class="app-window auxiliary-window window-hidden" data-window="notes">
-          <header class="window-titlebar">
-            <div class="window-brand">
-              <div class="window-orb notes-orb" aria-hidden="true"></div>
-              <div class="brand-copy">
-                <p class="eyebrow">LOCAL NOTES</p>
-                <h1>notes.txt</h1>
-              </div>
+      <main class="app-main">
+        <div class="chat-layout">
+          <aside class="chat-sidebar">
+            <div class="sidebar-head">
+              <h2>Chats</h2>
+              <button class="new-chat-button" id="new-session-button" type="button">+ New chat</button>
             </div>
-            <div class="titlebar-meta">
+            <div class="session-list" id="session-list"></div>
+            <div class="sessions-empty hidden" id="sessions-empty">
+              Start a new chat to create the first saved conversation for this profile.
+            </div>
+            <div class="sidebar-footer">
+              <button class="sidebar-utility-button" data-panel-toggle="notes" type="button">Notes</button>
+              <button class="sidebar-utility-button" data-panel-toggle="settings" type="button">Profiles</button>
+            </div>
+          </aside>
+
+          <section class="chat-main">
+            <section class="transcript-shell">
+              <div class="transcript" id="transcript"></div>
+              <div class="empty-state" id="empty-state">
+                <div class="empty-orb" aria-hidden="true"></div>
+                <h2>Chat, stream, rate, repeat.</h2>
+                <p>
+                  Keep one clean chat flow: talk normally, let replies stream in live, then rate the turns that are
+                  worth training on.
+                </p>
+              </div>
+            </section>
+
+            <section class="composer-shell">
+              <div class="composer-frame">
+                <textarea id="prompt-input" rows="1" placeholder="Ask anything..."></textarea>
+                <button class="send-button" id="send-button" type="button" aria-label="Send message">
+                  <span class="send-button-icon" aria-hidden="true">&#10148;</span>
+                </button>
+              </div>
+            </section>
+          </section>
+        </div>
+
+        <aside class="utility-panel hidden" data-panel="notes" aria-hidden="true">
+          <div class="panel-head">
+            <div class="panel-copy">
+              <p class="eyebrow">SESSION NOTES</p>
+              <h2>Notes</h2>
+            </div>
+            <div class="panel-head-meta">
               <div class="model-pill" id="notes-profile-label">Profile</div>
-              <div class="window-controls">
-                <button
-                  class="window-control close-control"
-                  data-window-action="close"
-                  data-target-window="notes"
-                  type="button"
-                  aria-label="Close notes"
-                ></button>
-              </div>
+              <button class="panel-close-button" data-panel-close="notes" type="button" aria-label="Close notes">
+                Close
+              </button>
             </div>
-          </header>
-          <div class="aux-window-body notes-body">
+          </div>
+          <div class="notes-body">
             <div class="notepad-sheet">
               <p class="notepad-caption">
-                Save steering notes, made-up example scenarios, or pitfalls to avoid for the active training profile.
+                Keep compact steering notes for the active profile without leaving the main chat flow.
               </p>
               <textarea
                 id="guidance-input"
@@ -136,36 +95,27 @@
               ></textarea>
               <div class="notepad-actions">
                 <p class="save-status" id="guidance-status">Saved notes apply to future prompts.</p>
-                <button class="primary-button" id="guidance-save-button" type="button">Save notes</button>
+                <button class="primary-button" id="guidance-save-button" type="button">Save</button>
               </div>
             </div>
           </div>
-        </section>
+        </aside>
 
-        <section class="app-window auxiliary-window window-hidden" data-window="settings">
-          <header class="window-titlebar">
-            <div class="window-brand">
-              <div class="window-orb settings-orb" aria-hidden="true"></div>
-              <div class="brand-copy">
-                <p class="eyebrow">LOCAL SETTINGS</p>
-                <h1>Training Profiles</h1>
-              </div>
+        <aside class="utility-panel hidden" data-panel="settings" aria-hidden="true">
+          <div class="panel-head">
+            <div class="panel-copy">
+              <p class="eyebrow">TRAINING PROFILES</p>
+              <h2>Profiles</h2>
             </div>
-            <div class="titlebar-meta">
+            <div class="panel-head-meta">
               <div class="model-pill" id="settings-active-profile">Profile</div>
-              <div class="window-controls">
-                <button
-                  class="window-control close-control"
-                  data-window-action="close"
-                  data-target-window="settings"
-                  type="button"
-                  aria-label="Close settings"
-                ></button>
-              </div>
+              <button class="panel-close-button" data-panel-close="settings" type="button" aria-label="Close profiles">
+                Close
+              </button>
             </div>
-          </header>
+          </div>
 
-          <div class="aux-window-body settings-body">
+          <div class="settings-body">
             <section class="settings-sidebar">
               <p class="settings-kicker">Create profile</p>
               <label class="field-label" for="profile-name-input">New profile name</label>
@@ -191,32 +141,8 @@
               </div>
             </section>
           </div>
-        </section>
+        </aside>
       </main>
-
-      <footer class="taskbar">
-        <div class="taskbar-gloss" aria-hidden="true"></div>
-        <button class="start-button" type="button" aria-label="Open Start menu">
-          <span class="start-orb" aria-hidden="true">
-            <span class="start-orb-window"></span>
-          </span>
-          <span class="start-label">Start</span>
-        </button>
-        <div class="taskbar-divider" aria-hidden="true"></div>
-        <div class="taskbar-programs" aria-label="Open programs">
-          <button class="taskbar-pill" data-task-app="chat" type="button">local-chat.exe</button>
-          <button class="taskbar-pill" data-task-app="notes" type="button">notes.txt</button>
-          <button class="taskbar-pill" data-task-app="settings" type="button">settings.cpl</button>
-        </div>
-        <div class="taskbar-status">
-          <span class="taskbar-network" id="taskbar-network">Local online</span>
-          <div class="taskbar-tray">
-            <span class="tray-dot" aria-hidden="true"></span>
-            <span class="tray-dot" aria-hidden="true"></span>
-            <span class="taskbar-clock" id="desktop-clock">--:--</span>
-          </div>
-        </div>
-      </footer>
     </div>
 
     <template id="message-template">
@@ -251,6 +177,6 @@
       </article>
     </template>
 
-    <script src="/static/app.js?v=20260319n"></script>
+    <script src="/static/app.js?v=20260322a"></script>
   </body>
 </html>

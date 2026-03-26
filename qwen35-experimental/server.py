@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -11,6 +12,7 @@ import gc
 from pathlib import Path
 from typing import Any
 
+import httpx
 import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -77,6 +79,14 @@ TRAIN_GRADIENT_CHECKPOINTING = os.environ.get("QWEN35_TRAIN_GRADIENT_CHECKPOINTI
     "on",
 }
 TRAIN_SAVE_EVERY_STEPS = int(os.environ.get("QWEN35_TRAIN_SAVE_EVERY_STEPS", "1"))
+SGLANG_ENABLED = os.environ.get("QWEN35_USE_SGLANG", "1").strip().lower() in {"1", "true", "yes", "on"}
+SGLANG_BASE_URL = os.environ.get("QWEN35_SGLANG_BASE_URL", "http://127.0.0.1:30101").rstrip("/")
+SGLANG_CHAT_URL = f"{SGLANG_BASE_URL}/v1/chat/completions"
+SGLANG_HEALTH_URL = f"{SGLANG_BASE_URL}/health"
+SGLANG_REQUEST_TIMEOUT = float(os.environ.get("QWEN35_SGLANG_TIMEOUT_SECONDS", str(max(STREAM_TIMEOUT, 600.0))))
+SGLANG_SERVED_MODEL_NAME = os.environ.get("QWEN35_SGLANG_SERVED_MODEL_NAME", SERVED_MODEL_NAME).strip() or SERVED_MODEL_NAME
+SERVING_ALIASES_DIRNAME = os.environ.get("QWEN35_SERVING_ALIASES_DIRNAME", "serving-adapters").strip() or "serving-adapters"
+SERVING_ALIASES_KEEP = max(1, int(os.environ.get("QWEN35_SERVING_ALIASES_KEEP", "3")))
 
 _EXPLICIT_FEEDBACK_REWARD_BY_SCORE = {
     1: -1.00,
@@ -158,6 +168,10 @@ def _profile_train_state_path(profile_id: str) -> Path:
 
 def _profile_feedback_log_path(profile_id: str) -> Path:
     return _profile_dir(profile_id) / "feedback.jsonl"
+
+
+def _profile_serving_aliases_dir(profile_id: str) -> Path:
+    return _profile_dir(profile_id) / SERVING_ALIASES_DIRNAME
 
 
 def _default_profile_meta(profile_id: str, name: str, *, created_at: float | None = None) -> dict[str, Any]:
@@ -343,6 +357,7 @@ def _activate_profile(profile_id: str, *, load_model: bool = True) -> dict[str, 
     _reset_loaded_runtime()
     if load_model:
         _load_model()
+        _ensure_active_serving_adapter_path(force_refresh=False)
     return _profile_summary(profile_id)
 
 
@@ -363,6 +378,8 @@ def _default_train_state() -> dict[str, Any]:
         "last_grad_norm": None,
         "last_note": "",
         "last_session_id": "",
+        "serving_adapter_path": "",
+        "last_serving_synced_at": None,
     }
 
 
@@ -390,6 +407,73 @@ def _save_train_state() -> None:
         json.dumps(_train_state, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+
+
+def _remove_path(path: Path) -> None:
+    try:
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.exists():
+            shutil.rmtree(path)
+    except FileNotFoundError:
+        return
+
+
+def _refresh_serving_adapter_alias(profile_id: str) -> str | None:
+    adapter_dir = _profile_adapter_dir(profile_id)
+    adapter_config_path = adapter_dir / "adapter_config.json"
+    if not adapter_config_path.exists():
+        return None
+
+    aliases_dir = _profile_serving_aliases_dir(profile_id)
+    aliases_dir.mkdir(parents=True, exist_ok=True)
+
+    train_steps = 0
+    if _train_state is not None:
+        train_steps = int(_train_state.get("train_steps", 0) or 0)
+    alias_path = aliases_dir / f"adapter-step-{train_steps:06d}-{int(time.time())}"
+    if alias_path.exists() or alias_path.is_symlink():
+        _remove_path(alias_path)
+    alias_path.symlink_to(adapter_dir, target_is_directory=True)
+
+    alias_entries = sorted(
+        aliases_dir.iterdir(),
+        key=lambda item: item.lstat().st_mtime if item.exists() or item.is_symlink() else 0.0,
+        reverse=True,
+    )
+    for stale in alias_entries[SERVING_ALIASES_KEEP:]:
+        _remove_path(stale)
+
+    return str(alias_path)
+
+
+def _ensure_active_serving_adapter_path(*, force_refresh: bool = False) -> str | None:
+    global _train_state
+
+    if _train_state is None:
+        _train_state = _load_train_state()
+
+    adapter_ready = (_active_adapter_dir() / "adapter_config.json").exists()
+    if not adapter_ready:
+        _train_state["serving_adapter_path"] = ""
+        _train_state["last_serving_synced_at"] = None
+        _save_train_state()
+        return None
+
+    existing_value = str(_train_state.get("serving_adapter_path") or "").strip()
+    existing_path = Path(existing_value).expanduser() if existing_value else None
+    if not force_refresh and existing_path is not None and existing_path.exists():
+        return str(existing_path)
+
+    refreshed = _refresh_serving_adapter_alias(_get_active_profile_id())
+    _train_state["serving_adapter_path"] = refreshed or ""
+    _train_state["last_serving_synced_at"] = time.time() if refreshed else None
+    _save_train_state()
+    return refreshed
+
+
+def _active_serving_adapter_path() -> str | None:
+    return _ensure_active_serving_adapter_path(force_refresh=False)
 
 
 def _append_feedback_log(entry: dict[str, Any]) -> None:
@@ -437,6 +521,41 @@ def _normalize_messages(messages: Any) -> list[dict[str, str]]:
     return normalized
 
 
+def _prepare_qwen_template_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    system_parts: list[str] = []
+    conversation: list[dict[str, str]] = []
+    for message in messages:
+        if message["role"] == "system":
+            content = message["content"].strip()
+            if content:
+                system_parts.append(content)
+            continue
+        conversation.append(message)
+
+    if not system_parts:
+        return list(messages)
+
+    merged_system = "\n\n".join(system_parts).strip()
+    if not merged_system:
+        return conversation
+    return [{"role": "system", "content": merged_system}, *conversation]
+
+
+async def _aiter_sse_payloads(response: httpx.Response):
+    data_lines: list[str] = []
+    async for line in response.aiter_lines():
+        if line == "":
+            if data_lines:
+                payload = "\n".join(data_lines)
+                data_lines = []
+                yield payload
+            continue
+        if line.startswith("data:"):
+            data_lines.append(line[5:].lstrip())
+    if data_lines:
+        yield "\n".join(data_lines)
+
+
 def _first_model_device() -> torch.device:
     if _model is None:
         raise RuntimeError("Model has not been loaded")
@@ -466,8 +585,9 @@ def _tokenize_messages(
     add_generation_prompt: bool,
     enable_thinking: bool = False,
 ) -> torch.Tensor:
+    template_messages = _prepare_qwen_template_messages(messages)
     ids = _tokenizer.apply_chat_template(
-        messages,
+        template_messages,
         add_generation_prompt=add_generation_prompt,
         **_chat_template_kwargs(enable_thinking=enable_thinking),
     )
@@ -548,8 +668,26 @@ def _trim_partial_markup(text: str, *, final: bool) -> str:
     return text.lstrip()
 
 
+def _split_labeled_final_answer(text: str, *, final: bool) -> tuple[str, str] | None:
+    matches = list(re.finditer(r"(?:^|\n)\s*(?:Final Answer|Final Response|Answer|Response)\s*:\s*", text, flags=re.I))
+    if not matches:
+        return None
+    match = matches[-1]
+    reasoning = _trim_partial_markup(text[: match.start()], final=final)
+    content = _trim_partial_markup(text[match.end() :], final=final)
+    return reasoning, content
+
+
+def _looks_like_reasoning_transcript(text: str) -> bool:
+    stripped = text.lstrip()
+    return bool(re.match(r"(?is)(thinking process:|1\.\s+\*\*analyze the request|\d+\.\s+\*\*)", stripped))
+
+
 def _split_thinking_text(text: str, *, final: bool) -> tuple[str, str]:
     cleaned = text.replace("<|im_end|>", "").replace("<|endoftext|>", "")
+    labeled_split = _split_labeled_final_answer(cleaned, final=final)
+    if labeled_split is not None:
+        return labeled_split
     open_idx = cleaned.find("<think>")
     if open_idx == -1:
         close_idx = cleaned.find("</think>")
@@ -559,6 +697,9 @@ def _split_thinking_text(text: str, *, final: bool) -> tuple[str, str]:
             return reasoning, content
         if not final:
             reasoning = _trim_partial_markup(cleaned, final=False)
+            return reasoning, ""
+        if _looks_like_reasoning_transcript(cleaned):
+            reasoning = _trim_partial_markup(cleaned, final=final)
             return reasoning, ""
         content = _trim_partial_markup(cleaned, final=final)
         return "", content
@@ -629,6 +770,52 @@ def _score_to_reward(score: int) -> float:
     return _EXPLICIT_FEEDBACK_REWARD_BY_SCORE.get(score, 0.0)
 
 
+def _build_sglang_request_body(
+    *,
+    messages: list[dict[str, str]],
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    enable_thinking: bool,
+    stream: bool,
+    lora_path: str | None,
+) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "model": SGLANG_SERVED_MODEL_NAME,
+        "messages": messages,
+        "stream": stream,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "separate_reasoning": True,
+        "stream_reasoning": True,
+        "chat_template_kwargs": {
+            "enable_thinking": bool(enable_thinking),
+        },
+    }
+    if lora_path:
+        body["lora_path"] = lora_path
+    return body
+
+
+def _sglang_health_snapshot() -> dict[str, Any]:
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            response = client.get(SGLANG_HEALTH_URL)
+    except Exception as exc:
+        return {"ok": False, "detail": str(exc)}
+
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {"status_code": response.status_code, "body": response.text[:300]}
+
+    if isinstance(payload, dict):
+        payload.setdefault("ok", response.status_code == 200)
+        return payload
+    return {"ok": response.status_code == 200, "detail": payload}
+
+
 def _lora_config() -> LoraConfig:
     return LoraConfig(
         r=LORA_R,
@@ -664,6 +851,7 @@ def _save_adapter_checkpoint() -> None:
     _model.save_pretrained(_active_adapter_dir())
     if _optimizer is not None:
         torch.save(_optimizer.state_dict(), _active_optimizer_path())
+    _ensure_active_serving_adapter_path(force_refresh=True)
     _save_train_state()
 
 
@@ -735,8 +923,9 @@ def _load_model() -> None:
 
 
 def _build_inputs(messages: list[dict[str, str]], *, enable_thinking: bool = False) -> dict[str, torch.Tensor]:
+    template_messages = _prepare_qwen_template_messages(messages)
     batch = _tokenizer.apply_chat_template(
-        messages,
+        template_messages,
         tokenize=True,
         add_generation_prompt=True,
         return_tensors="pt",
@@ -785,67 +974,283 @@ def _build_training_tensors(
     )
 
 
-def _generate_chat_completion(body: dict[str, Any]) -> dict[str, Any]:
-    stream = bool(body.get("stream", False))
-    if stream:
-        raise HTTPException(status_code=400, detail="stream=true is not supported by this experimental server")
+def _finalize_generated_text(raw_text: str, *, enable_thinking: bool) -> tuple[str, str]:
+    if enable_thinking:
+        reasoning_text, visible_text = _split_thinking_text(raw_text, final=True)
+    else:
+        reasoning_text = ""
+        visible_text = _strip_thinking(raw_text)
+    reasoning_text = reasoning_text.strip()
+    visible_text = visible_text.strip()
+    return reasoning_text, visible_text
 
+
+def _chat_completion_payload(
+    *,
+    response_id: str,
+    created_at: int,
+    visible_text: str,
+    reasoning_text: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    metrics: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "id": response_id,
+        "object": "chat.completion",
+        "created": created_at,
+        "model": SERVED_MODEL_NAME,
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": visible_text,
+                    "reasoning_content": reasoning_text,
+                },
+            }
+        ],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+        "metrics": metrics,
+    }
+
+
+def _generate_local_chat_completion(
+    *,
+    messages: list[dict[str, str]],
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    enable_thinking: bool,
+) -> dict[str, Any]:
+    with _model_lock:
+        _load_model()
+        model_inputs = _build_inputs(messages, enable_thinking=enable_thinking)
+        prompt_tokens = int(model_inputs["input_ids"].shape[1])
+        generation_kwargs = _generation_kwargs(
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+        )
+        started_at = time.perf_counter()
+        with torch.inference_mode():
+            output_ids = _model.generate(**model_inputs, **generation_kwargs)
+
+    generated_ids = output_ids[0][prompt_tokens:]
+    completion_tokens = int(generated_ids.shape[0])
+    raw_text = _tokenizer.decode(generated_ids, skip_special_tokens=False)
+    reasoning_text, visible_text = _finalize_generated_text(raw_text, enable_thinking=enable_thinking)
+    if not visible_text and not reasoning_text:
+        raise HTTPException(status_code=502, detail="Local model returned an empty response")
+
+    metrics = _stream_metrics(
+        visible_text=visible_text or reasoning_text,
+        raw_text=raw_text,
+        started_at=started_at,
+    )
+    return _chat_completion_payload(
+        response_id=f"chatcmpl-{uuid.uuid4().hex}",
+        created_at=int(time.time()),
+        visible_text=visible_text,
+        reasoning_text=reasoning_text if enable_thinking else "",
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        metrics=metrics,
+    )
+
+
+async def _stream_local_chat_completion(
+    *,
+    messages: list[dict[str, str]],
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    enable_thinking: bool,
+):
+    with _model_lock:
+        _load_model()
+        model_inputs = _build_inputs(messages, enable_thinking=enable_thinking)
+        prompt_tokens = int(model_inputs["input_ids"].shape[1])
+
+    response_id = f"chatcmpl-{uuid.uuid4().hex}"
+    created_at = int(time.time())
+    started_at: float | None = None
+    raw_text = ""
+    visible_text = ""
+    reasoning_text = ""
+    sent_role = False
+    stop_event = threading.Event()
+    error_holder: dict[str, Exception] = {}
+    streamer = AsyncTextIteratorStreamer(
+        _tokenizer,
+        skip_prompt=True,
+        timeout=STREAM_TIMEOUT,
+        skip_special_tokens=False,
+        clean_up_tokenization_spaces=False,
+    )
+
+    generation_kwargs = _generation_kwargs(
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        streamer=streamer,
+        stop_event=stop_event,
+    )
+
+    def _run_generation() -> None:
+        try:
+            with _model_lock:
+                with torch.inference_mode():
+                    _model.generate(**model_inputs, **generation_kwargs)
+        except Exception as exc:  # pragma: no cover - background generation path
+            error_holder["error"] = exc
+            streamer.on_finalized_text("", stream_end=True)
+
+    thread = threading.Thread(target=_run_generation, daemon=True)
+    thread.start()
+
+    try:
+        async for chunk in streamer:
+            if started_at is None:
+                started_at = time.perf_counter()
+
+            raw_text += chunk
+            if enable_thinking:
+                next_reasoning_text, next_visible_text = _split_thinking_text(raw_text, final=False)
+            else:
+                next_reasoning_text = ""
+                next_visible_text = _strip_thinking_partial(raw_text, final=False)
+
+            reasoning_delta = next_reasoning_text[len(reasoning_text) :] if next_reasoning_text.startswith(reasoning_text) else next_reasoning_text
+            content_delta = next_visible_text[len(visible_text) :] if next_visible_text.startswith(visible_text) else next_visible_text
+            reasoning_text = next_reasoning_text
+            visible_text = next_visible_text
+
+            metrics = (
+                _stream_metrics(visible_text=visible_text, raw_text=raw_text, started_at=started_at)
+                if started_at is not None
+                else {}
+            )
+
+            if not content_delta and not reasoning_delta:
+                continue
+
+            delta_payload: dict[str, Any] = {}
+            if content_delta:
+                delta_payload["content"] = content_delta
+            if reasoning_delta:
+                delta_payload["reasoning_content"] = reasoning_delta
+            if not sent_role:
+                delta_payload["role"] = "assistant"
+                sent_role = True
+
+            yield _sse_data(
+                {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_at,
+                    "model": SERVED_MODEL_NAME,
+                    "metrics": metrics,
+                    "choices": [{"index": 0, "delta": delta_payload, "finish_reason": None}],
+                }
+            )
+
+        if "error" in error_holder:
+            raise HTTPException(status_code=502, detail=f"Local generation failed: {error_holder['error']}")
+
+        final_reasoning_text, final_visible_text = _finalize_generated_text(raw_text, enable_thinking=enable_thinking)
+        if not final_visible_text and not final_reasoning_text:
+            raise HTTPException(status_code=502, detail="Local model returned an empty response")
+
+        final_metrics = _stream_metrics(
+            visible_text=final_visible_text or final_reasoning_text,
+            raw_text=raw_text,
+            started_at=started_at or time.perf_counter(),
+        )
+        yield _sse_data(
+            {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created_at,
+                "model": SERVED_MODEL_NAME,
+                "metrics": final_metrics,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": len(_tokenizer.encode(raw_text, add_special_tokens=False)),
+                    "total_tokens": prompt_tokens + len(_tokenizer.encode(raw_text, add_special_tokens=False)),
+                },
+            }
+        )
+        yield "data: [DONE]\n\n"
+    finally:
+        stop_event.set()
+        thread.join(timeout=1.0)
+
+
+def _generate_chat_completion(body: dict[str, Any]) -> dict[str, Any]:
     messages = _normalize_messages(body.get("messages"))
     max_tokens = int(body.get("max_tokens") or DEFAULT_MAX_NEW_TOKENS)
     max_tokens = max(1, min(max_tokens, 1024))
     temperature = float(body.get("temperature") if body.get("temperature") is not None else DEFAULT_TEMPERATURE)
     top_p = float(body.get("top_p") if body.get("top_p") is not None else DEFAULT_TOP_P)
     enable_thinking = _bool_flag(body.get("enable_thinking") or body.get("thinking"))
-
-    with _model_lock:
-        _load_model()
-        _model.eval()
-        inputs = _build_inputs(messages, enable_thinking=enable_thinking)
-        prompt_len = int(inputs["input_ids"].shape[-1])
-        generation_kwargs = _generation_kwargs(
+    if not SGLANG_ENABLED:
+        return _generate_local_chat_completion(
+            messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            enable_thinking=enable_thinking,
         )
-        with torch.inference_mode():
-            generated = _model.generate(**inputs, **generation_kwargs)
+    with _model_lock:
+        _load_model()
+        lora_path = _active_serving_adapter_path() if SGLANG_ENABLED else None
 
-        new_tokens = generated[0][prompt_len:]
-        raw_text = _tokenizer.decode(new_tokens, skip_special_tokens=False)
-        reasoning_text, text = _split_thinking_text(raw_text, final=True)
-        if not enable_thinking:
-            text = _strip_thinking(raw_text)
-            reasoning_text = ""
-        if not text:
-            text = raw_text.strip()
+    request_body = _build_sglang_request_body(
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        enable_thinking=enable_thinking,
+        stream=False,
+        lora_path=lora_path,
+    )
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    try:
+        with httpx.Client(timeout=SGLANG_REQUEST_TIMEOUT) as client:
+            response = client.post(SGLANG_CHAT_URL, json=request_body)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"SGLang request failed: {exc}") from exc
 
-    completion_tokens = int(new_tokens.shape[0])
-    response_id = f"chatcmpl-{uuid.uuid4().hex}"
-    return {
-        "id": response_id,
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": SERVED_MODEL_NAME,
-        "choices": [
-            {
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": text,
-                    "reasoning_content": reasoning_text,
-                },
-                "finish_reason": "stop",
-            }
-        ],
-        "usage": {
-            "prompt_tokens": prompt_len,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_len + completion_tokens,
-        },
-    }
+    if response.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"SGLang error {response.status_code}: {response.text[:1200]}")
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="SGLang returned invalid JSON") from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail="SGLang returned an unexpected payload shape")
+
+    payload["model"] = SERVED_MODEL_NAME
+    if isinstance(payload.get("choices"), list):
+        for choice in payload["choices"]:
+            if not isinstance(choice, dict):
+                continue
+            message = choice.get("message")
+            if not isinstance(message, dict):
+                continue
+            if not enable_thinking:
+                message["reasoning_content"] = ""
+            message.setdefault("role", "assistant")
+    return payload
 
 
 async def _stream_chat_completion(body: dict[str, Any]):
@@ -855,151 +1260,130 @@ async def _stream_chat_completion(body: dict[str, Any]):
     temperature = float(body.get("temperature") if body.get("temperature") is not None else DEFAULT_TEMPERATURE)
     top_p = float(body.get("top_p") if body.get("top_p") is not None else DEFAULT_TOP_P)
     enable_thinking = _bool_flag(body.get("enable_thinking") or body.get("thinking"))
-    response_id = f"chatcmpl-{uuid.uuid4().hex}"
-    created_at = int(time.time())
-    stop_event = threading.Event()
-    thread_error: dict[str, BaseException] = {}
-
-    with _model_lock:
-        _load_model()
-        _model.eval()
-        inputs = _build_inputs(messages, enable_thinking=enable_thinking)
-        prompt_len = int(inputs["input_ids"].shape[-1])
-        started_at = time.perf_counter()
-        streamer = AsyncTextIteratorStreamer(
-            _tokenizer,
-            skip_prompt=True,
-            skip_special_tokens=False,
-            timeout=STREAM_TIMEOUT,
-        )
-        generation_kwargs = _generation_kwargs(
+    if not SGLANG_ENABLED:
+        async for payload in _stream_local_chat_completion(
+            messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
-            streamer=streamer,
-            stop_event=stop_event,
-        )
+            enable_thinking=enable_thinking,
+        ):
+            yield payload
+        return
+    with _model_lock:
+        _load_model()
+        lora_path = _active_serving_adapter_path() if SGLANG_ENABLED else None
 
-        def _run_generate() -> None:
-            try:
-                with torch.inference_mode():
-                    _model.generate(**inputs, **generation_kwargs)
-            except BaseException as exc:  # pragma: no cover - background execution
-                thread_error["error"] = exc
-                try:
-                    streamer.end()
-                except Exception:
-                    pass
+    request_body = _build_sglang_request_body(
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        enable_thinking=enable_thinking,
+        stream=True,
+        lora_path=lora_path,
+    )
 
-        worker = threading.Thread(target=_run_generate, name="qwen35-stream-generate", daemon=True)
-        worker.start()
+    started_at: float | None = None
+    visible_text = ""
+    reasoning_text = ""
+    response_id = f"chatcmpl-{uuid.uuid4().hex}"
+    created_at = int(time.time())
+    sent_role = False
 
-        raw_text = ""
-        reasoning_text = ""
-        visible_text = ""
-        sent_role = False
+    timeout = httpx.Timeout(SGLANG_REQUEST_TIMEOUT, read=SGLANG_REQUEST_TIMEOUT)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream("POST", SGLANG_CHAT_URL, json=request_body) as response:
+                if response.status_code != 200:
+                    detail = (await response.aread()).decode("utf-8", errors="replace")[:1200]
+                    raise HTTPException(status_code=502, detail=f"SGLang error {response.status_code}: {detail}")
 
-        try:
-            async for piece in streamer:
-                raw_text += piece
-                if enable_thinking:
-                    next_reasoning, next_visible = _split_thinking_text(raw_text, final=False)
-                else:
-                    next_reasoning = ""
-                    next_visible = _strip_thinking_partial(raw_text, final=False)
-                if next_reasoning.startswith(reasoning_text):
-                    reasoning_delta = next_reasoning[len(reasoning_text) :]
-                else:
-                    reasoning_delta = next_reasoning
-                reasoning_text = next_reasoning
-                if next_visible.startswith(visible_text):
-                    delta = next_visible[len(visible_text) :]
-                else:
-                    delta = next_visible
-                visible_text = next_visible
-                if not delta and not reasoning_delta:
-                    continue
-                chunk_delta: dict[str, Any] = {}
-                if delta:
-                    chunk_delta["content"] = delta
-                if reasoning_delta:
-                    chunk_delta["reasoning_content"] = reasoning_delta
-                if not sent_role:
-                    chunk_delta["role"] = "assistant"
-                    sent_role = True
+                async for raw_payload in _aiter_sse_payloads(response):
+                    if raw_payload == "[DONE]":
+                        break
+
+                    try:
+                        payload = json.loads(raw_payload)
+                    except json.JSONDecodeError as exc:
+                        raise HTTPException(status_code=502, detail="SGLang returned invalid streaming JSON") from exc
+
+                    if not isinstance(payload, dict):
+                        continue
+
+                    if started_at is None:
+                        started_at = time.perf_counter()
+                    response_id = str(payload.get("id") or response_id)
+                    created_at = int(payload.get("created") or created_at)
+
+                    choices = payload.get("choices") or []
+                    if not choices or not isinstance(choices[0], dict):
+                        continue
+                    choice = choices[0]
+                    delta = choice.get("delta") or {}
+                    finish_reason = choice.get("finish_reason")
+
+                    content_delta = str(delta.get("content") or "")
+                    reasoning_delta = str(delta.get("reasoning_content") or "") if enable_thinking else ""
+                    if content_delta:
+                        visible_text += content_delta
+                    if reasoning_delta:
+                        reasoning_text += reasoning_delta
+
+                    raw_text = f"{reasoning_text}{visible_text}"
+                    metrics = (
+                        _stream_metrics(visible_text=visible_text, raw_text=raw_text, started_at=started_at)
+                        if started_at is not None
+                        else {}
+                    )
+
+                    if content_delta or reasoning_delta or finish_reason is not None:
+                        emitted_delta: dict[str, Any] = {}
+                        if content_delta:
+                            emitted_delta["content"] = content_delta
+                        if reasoning_delta:
+                            emitted_delta["reasoning_content"] = reasoning_delta
+                        if not sent_role:
+                            emitted_delta["role"] = "assistant"
+                            sent_role = True
+                        elif "role" in delta:
+                            emitted_delta["role"] = delta["role"]
+                        yield _sse_data(
+                            {
+                                "id": response_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_at,
+                                "model": SERVED_MODEL_NAME,
+                                "metrics": metrics,
+                                "choices": [{"index": 0, "delta": emitted_delta, "finish_reason": finish_reason}],
+                            }
+                        )
+
+                if not visible_text:
+                    raise HTTPException(status_code=502, detail="SGLang returned an empty response")
+
+                final_metrics = (
+                    _stream_metrics(
+                        visible_text=visible_text,
+                        raw_text=f"{reasoning_text}{visible_text}",
+                        started_at=started_at or time.perf_counter(),
+                    )
+                )
                 yield _sse_data(
                     {
                         "id": response_id,
                         "object": "chat.completion.chunk",
                         "created": created_at,
                         "model": SERVED_MODEL_NAME,
-                        "metrics": _stream_metrics(visible_text=visible_text, raw_text=raw_text, started_at=started_at),
-                        "choices": [{"index": 0, "delta": chunk_delta, "finish_reason": None}],
+                        "metrics": final_metrics,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                     }
                 )
-
-            await asyncio.to_thread(worker.join, 5.0)
-            if thread_error.get("error") is not None:
-                raise thread_error["error"]
-
-            if enable_thinking:
-                final_reasoning, final_visible = _split_thinking_text(raw_text, final=True)
-            else:
-                final_reasoning = ""
-                final_visible = _strip_thinking_partial(raw_text, final=True)
-            if final_reasoning.startswith(reasoning_text):
-                trailing_reasoning = final_reasoning[len(reasoning_text) :]
-            else:
-                trailing_reasoning = final_reasoning
-            reasoning_text = final_reasoning
-            if final_visible.startswith(visible_text):
-                trailing = final_visible[len(visible_text) :]
-            else:
-                trailing = final_visible
-            visible_text = final_visible
-
-            if trailing or trailing_reasoning:
-                chunk_delta: dict[str, Any] = {}
-                if trailing:
-                    chunk_delta["content"] = trailing
-                if trailing_reasoning:
-                    chunk_delta["reasoning_content"] = trailing_reasoning
-                if not sent_role:
-                    chunk_delta["role"] = "assistant"
-                    sent_role = True
-                yield _sse_data(
-                    {
-                        "id": response_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_at,
-                        "model": SERVED_MODEL_NAME,
-                        "metrics": _stream_metrics(visible_text=visible_text, raw_text=raw_text, started_at=started_at),
-                        "choices": [{"index": 0, "delta": chunk_delta, "finish_reason": None}],
-                    }
-                )
-
-            if not visible_text:
-                raise HTTPException(status_code=502, detail="Model returned an empty response")
-
-            yield _sse_data(
-                {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created_at,
-                    "model": SERVED_MODEL_NAME,
-                    "metrics": _stream_metrics(visible_text=visible_text, raw_text=raw_text, started_at=started_at),
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                }
-            )
-            yield "data: [DONE]\n\n"
-        except asyncio.CancelledError:  # pragma: no cover - client disconnect path
-            stop_event.set()
-            raise
-        finally:
-            stop_event.set()
-            await asyncio.to_thread(worker.join, 1.0)
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                yield "data: [DONE]\n\n"
+    except asyncio.CancelledError:  # pragma: no cover - client disconnect path
+        raise
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"SGLang streaming request failed: {exc}") from exc
 
 
 def _train_on_feedback(body: dict[str, Any]) -> dict[str, Any]:
@@ -1115,12 +1499,14 @@ def _train_on_feedback(body: dict[str, Any]) -> dict[str, Any]:
 @app.on_event("startup")
 def startup_event() -> None:
     _load_model()
+    _ensure_active_serving_adapter_path(force_refresh=False)
 
 
 @app.get("/health")
 def health() -> JSONResponse:
     active_profile_id = _get_active_profile_id()
     loaded = _model is not None and _tokenizer is not None and _optimizer is not None and _train_state is not None
+    serving_adapter_path = _active_serving_adapter_path() if loaded else None
     detail = {
         "status": "ok" if loaded else "loading",
         "ok": loaded,
@@ -1136,6 +1522,10 @@ def health() -> JSONResponse:
         "compute_dtype": str(_compute_dtype()).replace("torch.", ""),
         "adapter_dir": str(_active_adapter_dir()),
         "adapter_ready": (_active_adapter_dir() / "adapter_config.json").exists(),
+        "serving_adapter_path": serving_adapter_path,
+        "serving_via_sglang": SGLANG_ENABLED,
+        "sglang_base_url": SGLANG_BASE_URL,
+        "sglang": _sglang_health_snapshot() if SGLANG_ENABLED else {"ok": False, "detail": "disabled"},
         "trainable_params": _trainable_param_count,
         "training": dict(_train_state or _default_train_state()),
     }

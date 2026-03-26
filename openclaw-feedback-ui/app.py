@@ -32,14 +32,34 @@ FEEDBACK_LOG_FILE = Path(FEEDBACK_LOG_FILE_VALUE).expanduser() if FEEDBACK_LOG_F
 COOKIE_NAME = "openclaw_rl_ui_session"
 PROXY_BASE_URL = os.environ.get("OPENCLAW_RL_PROXY_BASE_URL", "http://127.0.0.1:30000").rstrip("/")
 BACKEND_MODE = os.environ.get("OPENCLAW_RL_UI_BACKEND_MODE", "rl_proxy").strip().lower()
+SPLIT_BACKEND_MODES = {"split_trainer_api", "split_backends", "sglang_trainer"}
+SPLIT_BACKENDS = BACKEND_MODE in SPLIT_BACKEND_MODES
+CHAT_BACKEND_MODE = os.environ.get(
+    "OPENCLAW_RL_CHAT_BACKEND_MODE",
+    "openai_chat" if SPLIT_BACKENDS else BACKEND_MODE,
+).strip().lower()
+TRAINING_BACKEND_MODE = os.environ.get(
+    "OPENCLAW_RL_TRAINING_BACKEND_MODE",
+    "trainer_api" if SPLIT_BACKENDS else BACKEND_MODE,
+).strip().lower()
+CHAT_PROXY_BASE_URL = os.environ.get("OPENCLAW_RL_CHAT_PROXY_BASE_URL", PROXY_BASE_URL).rstrip("/")
+TRAINING_PROXY_BASE_URL = os.environ.get("OPENCLAW_RL_TRAINING_PROXY_BASE_URL", PROXY_BASE_URL).rstrip("/")
+PROFILE_PROXY_BASE_URL = os.environ.get("OPENCLAW_RL_PROFILE_PROXY_BASE_URL", TRAINING_PROXY_BASE_URL).rstrip("/")
 CHAT_PATH = os.environ.get("OPENCLAW_RL_CHAT_PATH", "/v1/chat/completions")
 FEEDBACK_PATH = os.environ.get("OPENCLAW_RL_FEEDBACK_PATH", "/v1/feedback")
-DEFAULT_HEALTH_PATH = "/healthz" if BACKEND_MODE == "rl_proxy" else "/health"
-HEALTH_PATH = os.environ.get("OPENCLAW_RL_HEALTH_PATH", DEFAULT_HEALTH_PATH)
-CHAT_URL = f"{PROXY_BASE_URL}{CHAT_PATH}"
-HEALTH_URL = f"{PROXY_BASE_URL}{HEALTH_PATH}"
-FEEDBACK_URL = f"{PROXY_BASE_URL}{FEEDBACK_PATH}"
+DEFAULT_CHAT_HEALTH_PATH = "/healthz" if CHAT_BACKEND_MODE == "rl_proxy" else "/health"
+DEFAULT_TRAINING_HEALTH_PATH = "/healthz" if TRAINING_BACKEND_MODE == "rl_proxy" else "/health"
+CHAT_HEALTH_PATH = os.environ.get("OPENCLAW_RL_CHAT_HEALTH_PATH", DEFAULT_CHAT_HEALTH_PATH)
+TRAINING_HEALTH_PATH = os.environ.get("OPENCLAW_RL_TRAINING_HEALTH_PATH", DEFAULT_TRAINING_HEALTH_PATH)
+CHAT_LOAD_LORA_PATH = os.environ.get("OPENCLAW_RL_CHAT_LOAD_LORA_PATH", "/load_lora_adapter")
+CHAT_URL = f"{CHAT_PROXY_BASE_URL}{CHAT_PATH}"
+CHAT_HEALTH_URL = f"{CHAT_PROXY_BASE_URL}{CHAT_HEALTH_PATH}"
+CHAT_LOAD_LORA_URL = f"{CHAT_PROXY_BASE_URL}{CHAT_LOAD_LORA_PATH}"
+TRAINING_HEALTH_URL = f"{TRAINING_PROXY_BASE_URL}{TRAINING_HEALTH_PATH}"
+FEEDBACK_URL = f"{TRAINING_PROXY_BASE_URL}{FEEDBACK_PATH}"
 API_KEY = os.environ.get("OPENCLAW_RL_API_KEY", "openclaw-local")
+CHAT_API_KEY = os.environ.get("OPENCLAW_RL_CHAT_API_KEY", API_KEY)
+TRAINING_API_KEY = os.environ.get("OPENCLAW_RL_TRAINING_API_KEY", API_KEY)
 MODEL_NAME = os.environ.get("OPENCLAW_RL_MODEL", "qwen3-0.6b-local")
 DEFAULT_PROFILE_ID = os.environ.get("OPENCLAW_RL_DEFAULT_PROFILE_ID", "default").strip() or "default"
 REQUEST_TIMEOUT = float(os.environ.get("OPENCLAW_RL_UI_TIMEOUT_SECONDS", "600"))
@@ -51,11 +71,25 @@ UI_THINKING_MAX_TOKENS = int(
 UI_HOST = os.environ.get("OPENCLAW_RL_UI_HOST", "127.0.0.1")
 UI_PORT = int(os.environ.get("OPENCLAW_RL_UI_PORT", "30001"))
 RL_SERVICE_NAME = os.environ.get("OPENCLAW_RL_SERVICE_NAME", "openclaw-rl.service")
+CHAT_SERVICE_NAME = os.environ.get(
+    "OPENCLAW_RL_CHAT_SERVICE_NAME",
+    RL_SERVICE_NAME if CHAT_BACKEND_MODE == BACKEND_MODE else "",
+).strip()
+TRAINING_SERVICE_NAME = os.environ.get(
+    "OPENCLAW_RL_TRAINING_SERVICE_NAME",
+    RL_SERVICE_NAME if TRAINING_BACKEND_MODE == BACKEND_MODE else "",
+).strip()
 FORCE_NO_THINK = os.environ.get("OPENCLAW_RL_FORCE_NO_THINK", "1").strip().lower() in {"1", "true", "yes", "on"}
-PROFILES_SUPPORTED = BACKEND_MODE == "trainer_api"
-PROFILES_URL = f"{PROXY_BASE_URL}/v1/profiles"
-PROFILE_CREATE_URL = f"{PROXY_BASE_URL}/v1/profiles"
-PROFILE_SELECT_URL = f"{PROXY_BASE_URL}/v1/profiles/select"
+USE_NATIVE_CHAT_THINKING = os.environ.get("OPENCLAW_RL_USE_NATIVE_CHAT_THINKING", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+PROFILES_SUPPORTED = TRAINING_BACKEND_MODE == "trainer_api"
+PROFILES_URL = f"{PROFILE_PROXY_BASE_URL}/v1/profiles"
+PROFILE_CREATE_URL = f"{PROFILE_PROXY_BASE_URL}/v1/profiles"
+PROFILE_SELECT_URL = f"{PROFILE_PROXY_BASE_URL}/v1/profiles/select"
 DEFAULT_SESSION_TITLE = "New chat"
 SESSION_TITLE_WORDS = 7
 SESSION_TITLE_MAX_CHARS = 64
@@ -73,7 +107,8 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 _state_lock = RLock()
 _browser_sessions: dict[str, dict[str, Any]] = {}
-_last_backend_restart_at = 0.0
+_last_service_restart_at: dict[str, float] = {}
+_last_loaded_chat_overlay_path = ""
 
 
 class ChatRequest(BaseModel):
@@ -406,7 +441,11 @@ def _serialize_state(state: dict[str, Any]) -> dict[str, Any]:
         "busy": state["busy"],
         "model": MODEL_NAME,
         "backend_mode": BACKEND_MODE,
-        "proxy_base_url": PROXY_BASE_URL,
+        "chat_backend_mode": CHAT_BACKEND_MODE,
+        "training_backend_mode": TRAINING_BACKEND_MODE,
+        "proxy_base_url": CHAT_PROXY_BASE_URL,
+        "chat_proxy_base_url": CHAT_PROXY_BASE_URL,
+        "training_proxy_base_url": TRAINING_PROXY_BASE_URL,
         "guidance_text": state.get("guidance_text", ""),
         "thinking_enabled": bool(state.get("thinking_enabled")),
         "active_profile_id": state.get("active_profile_id", DEFAULT_PROFILE_ID),
@@ -414,6 +453,10 @@ def _serialize_state(state: dict[str, Any]) -> dict[str, Any]:
         "sessions": state.get("sessions", []),
         "active_session_id": state.get("active_session_id", ""),
     }
+
+
+def _is_split_backend() -> bool:
+    return SPLIT_BACKENDS or CHAT_PROXY_BASE_URL != TRAINING_PROXY_BASE_URL or CHAT_BACKEND_MODE != TRAINING_BACKEND_MODE
 
 
 def _touch_state(state: dict[str, Any]) -> None:
@@ -497,6 +540,33 @@ def _trim_context(messages: list[dict[str, str]]) -> list[dict[str, str]]:
     return messages[-MAX_HISTORY_TURNS * 2 :]
 
 
+def _normalize_openai_chat_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    system_chunks: list[str] = []
+    normalized: list[dict[str, Any]] = []
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "").strip().lower()
+        if role == "system":
+            content = str(message.get("content") or "").strip()
+            if content:
+                system_chunks.append(content)
+            continue
+        normalized.append(message)
+
+    if not system_chunks:
+        return normalized
+
+    return [
+        {
+            "role": "system",
+            "content": "\n\n".join(system_chunks),
+        },
+        *normalized,
+    ]
+
+
 def _feedback_text(score: int, note: str) -> str:
     prefix = (
         f"[OpenClaw feedback] score={score}/10. "
@@ -526,6 +596,18 @@ def _guidance_message(guidance_text: str) -> dict[str, str] | None:
 
 def _chat_control_message(thinking_enabled: bool) -> dict[str, str] | None:
     if thinking_enabled and not FORCE_NO_THINK:
+        if not USE_NATIVE_CHAT_THINKING:
+            return {
+                "role": "system",
+                "content": (
+                    "Thinking mode is on. Answer using exactly this structure:\n"
+                    "Thinking:\n"
+                    "- one to three short bullets\n"
+                    "Final Answer:\n"
+                    "<the user-facing answer>\n"
+                    "Keep the Thinking section brief and always include Final Answer."
+                ),
+            }
         return None
     return {
         "role": "system",
@@ -536,11 +618,120 @@ def _chat_control_message(thinking_enabled: bool) -> dict[str, str] | None:
     }
 
 
-def _assistant_text(message: dict[str, Any]) -> str:
-    content = (message.get("content") or "").strip()
-    if content:
-        return content
-    return (message.get("reasoning_content") or "").strip()
+_FINAL_ANSWER_PATTERNS = (
+    re.compile(r"(?:^|\n)\s*(?:Final Answer|Final Response|Answer|Response|Construct Response|Output)\s*:\s*(.+)", re.I),
+    re.compile(r"(?:^|\n)\s*\*+\s*(?:Final Answer|Final Response|Answer|Response|Construct Response|Output)\s*:\s*(.+)", re.I),
+)
+
+
+def _extract_final_answer(reasoning_text: str) -> str:
+    clean_text = reasoning_text.strip()
+    if not clean_text:
+        return ""
+
+    for pattern in _FINAL_ANSWER_PATTERNS:
+        matches = [match.group(1).strip() for match in pattern.finditer(clean_text) if match.group(1).strip()]
+        if matches:
+            return matches[-1].strip("\"' ")
+    return ""
+
+
+def _looks_like_reasoning_leak(content: str, reasoning_text: str) -> bool:
+    clean_content = content.strip()
+    clean_reasoning = reasoning_text.strip()
+    if not clean_content:
+        return False
+    if clean_reasoning and clean_content == clean_reasoning:
+        return True
+    if clean_content.lower().startswith("thinking process:"):
+        return True
+    return bool(clean_reasoning) and bool(
+        re.search(r"(analyze the request|final decision|construct response|instruction priority)", clean_content, re.I)
+    )
+
+
+def _split_visible_thinking_response(text: str, *, final: bool) -> tuple[str, str]:
+    clean_text = text.strip()
+    if not clean_text:
+        return "", ""
+
+    matches = list(re.finditer(r"(?:^|\n)\s*Final Answer\s*:\s*", clean_text, flags=re.I))
+    if matches:
+        match = matches[-1]
+        reasoning = clean_text[: match.start()].strip()
+        content = clean_text[match.end() :].strip()
+        reasoning = re.sub(r"^\s*Thinking\s*:\s*", "", reasoning, flags=re.I).strip()
+        return reasoning, content
+
+    partial_final_match = re.search(r"(?:^|\n)\s*Final(?:\s+Answer)?\s*:?\s*$", clean_text, flags=re.I)
+    if partial_final_match and not final:
+        reasoning = clean_text[: partial_final_match.start()].strip()
+        reasoning = re.sub(r"^\s*Thinking\s*:?\s*", "", reasoning, flags=re.I).strip()
+        return reasoning, ""
+
+    thinking_match = re.match(r"^\s*Thinking\s*:\s*(.*)$", clean_text, flags=re.I | re.S)
+    if thinking_match:
+        reasoning = thinking_match.group(1).strip()
+        if not final:
+            partial_final_match = re.search(r"(?:^|\n)\s*Final(?:\s+Answer)?\s*:?\s*$", reasoning, flags=re.I)
+            if partial_final_match:
+                reasoning = reasoning[: partial_final_match.start()].strip()
+        return reasoning, ""
+
+    normalized_text = clean_text.lower()
+    if not final:
+        compact_text = re.sub(r"\s+", " ", normalized_text).strip()
+        if compact_text and "thinking:".startswith(compact_text):
+            return "", ""
+
+    if final:
+        return "", clean_text
+    return "", clean_text
+
+
+def _resolve_assistant_text(content: str, reasoning_text: str) -> str:
+    clean_content = content.strip()
+    clean_reasoning = reasoning_text.strip()
+    if clean_content and not _looks_like_reasoning_leak(clean_content, clean_reasoning):
+        return clean_content
+
+    extracted_answer = _extract_final_answer(clean_reasoning)
+    if extracted_answer:
+        return extracted_answer
+    return ""
+
+
+def _chat_backend_label() -> str:
+    return "Chat backend" if _is_split_backend() else "Training backend"
+
+
+def _training_backend_label() -> str:
+    return "Training backend" if _is_split_backend() else "Backend"
+
+
+def _get_loaded_chat_overlay_path() -> str:
+    with _state_lock:
+        return _last_loaded_chat_overlay_path
+
+
+def _set_loaded_chat_overlay_path(path: str) -> None:
+    global _last_loaded_chat_overlay_path
+    with _state_lock:
+        _last_loaded_chat_overlay_path = path
+
+
+def _clear_loaded_chat_overlay_path() -> None:
+    _set_loaded_chat_overlay_path("")
+
+
+def _should_resync_chat_overlay(detail: str) -> bool:
+    lowered = detail.lower()
+    markers = (
+        "never been loaded",
+        "not loaded",
+        "requested lora adapters are not loaded",
+    )
+    return any(marker in lowered for marker in markers)
 
 
 def _build_chat_request_body(
@@ -553,13 +744,19 @@ def _build_chat_request_body(
     max_tokens: int | None = None,
     stream: bool,
 ) -> dict[str, Any]:
+    request_messages = list(messages)
+    if CHAT_BACKEND_MODE == "openai_chat":
+        request_messages = _normalize_openai_chat_messages(request_messages)
+
+    native_thinking = USE_NATIVE_CHAT_THINKING and CHAT_BACKEND_MODE == "openai_chat"
+    effective_thinking = bool(thinking_enabled) and not FORCE_NO_THINK and native_thinking
     body: dict[str, Any] = {
         "model": MODEL_NAME,
-        "messages": messages,
+        "messages": request_messages,
         "stream": stream,
-        "enable_thinking": bool(thinking_enabled) and not FORCE_NO_THINK,
+        "enable_thinking": effective_thinking,
     }
-    if BACKEND_MODE == "rl_proxy":
+    if CHAT_BACKEND_MODE == "rl_proxy":
         body.update(
             {
                 "session_id": session_id,
@@ -567,13 +764,69 @@ def _build_chat_request_body(
                 "session_done": session_done,
             }
         )
-    elif BACKEND_MODE in {"openai_chat", "trainer_api"}:
+    elif CHAT_BACKEND_MODE == "openai_chat":
+        chat_template_kwargs = {"enable_thinking": effective_thinking}
+        extra_chat_template_kwargs = EXTRA_CHAT_BODY.get("chat_template_kwargs")
+        if isinstance(extra_chat_template_kwargs, dict):
+            chat_template_kwargs.update(extra_chat_template_kwargs)
+        body["chat_template_kwargs"] = chat_template_kwargs
+        if native_thinking:
+            body.update(
+                {
+                    "separate_reasoning": True,
+                    "stream_reasoning": True,
+                }
+            )
+        for key, value in EXTRA_CHAT_BODY.items():
+            if key == "chat_template_kwargs":
+                continue
+            body[key] = value
+    elif CHAT_BACKEND_MODE == "trainer_api":
         body.update(EXTRA_CHAT_BODY)
     else:
-        raise HTTPException(status_code=500, detail=f"Unsupported backend mode: {BACKEND_MODE}")
+        raise HTTPException(status_code=500, detail=f"Unsupported chat backend mode: {CHAT_BACKEND_MODE}")
     if max_tokens is not None:
         body["max_tokens"] = max_tokens
     return body
+
+
+async def _resolve_split_chat_overlay(*, force_sync: bool = False) -> dict[str, Any]:
+    if not _is_split_backend() or CHAT_BACKEND_MODE != "openai_chat":
+        return {}
+
+    training_health = await _fetch_health(TRAINING_HEALTH_URL)
+    if not bool(training_health.get("ok")):
+        detail = str(training_health.get("detail") or training_health.get("status") or "unavailable").strip()
+        raise HTTPException(status_code=503, detail=f"{_training_backend_label()} unavailable: {detail}")
+
+    serving_adapter_path = str(training_health.get("serving_adapter_path") or "").strip()
+    if not serving_adapter_path:
+        _clear_loaded_chat_overlay_path()
+        return {}
+
+    if not force_sync and _get_loaded_chat_overlay_path() == serving_adapter_path:
+        return {"lora_path": serving_adapter_path}
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            response = await client.post(
+                CHAT_LOAD_LORA_URL,
+                json={
+                    "lora_name": serving_adapter_path,
+                    "lora_path": serving_adapter_path,
+                    "pinned": False,
+                },
+            )
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"{_chat_backend_label()} LoRA sync failed: {exc}") from exc
+
+    if response.status_code != 200:
+        detail = response.text[:1200]
+        if "already loaded" not in detail.lower():
+            raise HTTPException(status_code=502, detail=f"{_chat_backend_label()} LoRA sync failed: {detail}")
+
+    _set_loaded_chat_overlay_path(serving_adapter_path)
+    return {"lora_path": serving_adapter_path}
 
 
 def _sse_event(event: str, payload: dict[str, Any]) -> str:
@@ -641,41 +894,49 @@ async def _proxy_chat(
     thinking_enabled: bool,
     max_tokens: int | None = None,
 ) -> dict[str, Any]:
-    body = _build_chat_request_body(
-        messages=messages,
-        session_id=session_id,
-        turn_type=turn_type,
-        session_done=session_done,
-        thinking_enabled=thinking_enabled,
-        max_tokens=max_tokens,
-        stream=False,
-    )
-
+    backend_label = _chat_backend_label()
     headers = {
-        "Authorization": f"Bearer {API_KEY}",
+        "Authorization": f"Bearer {CHAT_API_KEY}",
         "Content-Type": "application/json",
     }
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        try:
-            response = await client.post(CHAT_URL, json=body, headers=headers)
-        except httpx.HTTPError as exc:
-            detail = str(exc)
-            if _should_restart_backend(detail):
-                await _restart_backend_if_needed()
-                raise HTTPException(
-                    status_code=503,
-                    detail="The training backend disconnected and is being restarted. Wait about 30 seconds, then try again.",
-                ) from exc
-            raise HTTPException(status_code=502, detail=f"Training backend connection error: {detail}") from exc
-        if response.status_code != 200:
+        for attempt in range(2):
+            body = _build_chat_request_body(
+                messages=messages,
+                session_id=session_id,
+                turn_type=turn_type,
+                session_done=session_done,
+                thinking_enabled=thinking_enabled,
+                max_tokens=max_tokens,
+                stream=False,
+            )
+            body.update(await _resolve_split_chat_overlay(force_sync=attempt > 0))
+            try:
+                response = await client.post(CHAT_URL, json=body, headers=headers)
+            except httpx.HTTPError as exc:
+                detail = str(exc)
+                if _should_restart_backend(detail):
+                    _clear_loaded_chat_overlay_path()
+                    await _restart_service_if_needed(CHAT_SERVICE_NAME)
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"The {backend_label.lower()} disconnected and is being restarted. Wait about 30 seconds, then try again.",
+                    ) from exc
+                raise HTTPException(status_code=502, detail=f"{backend_label} connection error: {detail}") from exc
+            if response.status_code == 200:
+                break
             detail = response.text[:1200]
+            if response.status_code == 400 and attempt == 0 and _should_resync_chat_overlay(detail):
+                _clear_loaded_chat_overlay_path()
+                continue
             if response.status_code >= 500 and _should_restart_backend(detail):
-                await _restart_backend_if_needed()
+                _clear_loaded_chat_overlay_path()
+                await _restart_service_if_needed(CHAT_SERVICE_NAME)
                 raise HTTPException(
                     status_code=503,
-                    detail="The training backend worker crashed and is being restarted. Wait about 30 seconds, then try again.",
+                    detail=f"The {backend_label.lower()} worker crashed and is being restarted. Wait about 30 seconds, then try again.",
                 )
-            raise HTTPException(status_code=502, detail=f"Training backend error {response.status_code}: {detail}")
+            raise HTTPException(status_code=502, detail=f"{backend_label} error {response.status_code}: {detail}")
         try:
             payload = response.json()
         except ValueError as exc:
@@ -699,75 +960,83 @@ async def _proxy_chat_stream(
     thinking_enabled: bool,
     max_tokens: int | None = None,
 ):
-    body = _build_chat_request_body(
-        messages=messages,
-        session_id=session_id,
-        turn_type=turn_type,
-        session_done=session_done,
-        thinking_enabled=thinking_enabled,
-        max_tokens=max_tokens,
-        stream=True,
-    )
-
+    backend_label = _chat_backend_label()
     headers = {
-        "Authorization": f"Bearer {API_KEY}",
+        "Authorization": f"Bearer {CHAT_API_KEY}",
         "Content-Type": "application/json",
     }
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        try:
-            async with client.stream("POST", CHAT_URL, json=body, headers=headers) as response:
-                if response.status_code != 200:
-                    detail = (await response.aread()).decode("utf-8", errors="replace")[:1200]
-                    if response.status_code >= 500 and _should_restart_backend(detail):
-                        await _restart_backend_if_needed()
-                        raise HTTPException(
-                            status_code=503,
-                            detail="The training backend crashed and is being restarted. Wait about 30 seconds, then try again.",
-                        )
-                    raise HTTPException(status_code=502, detail=f"Streaming backend error {response.status_code}: {detail}")
+        for attempt in range(2):
+            body = _build_chat_request_body(
+                messages=messages,
+                session_id=session_id,
+                turn_type=turn_type,
+                session_done=session_done,
+                thinking_enabled=thinking_enabled,
+                max_tokens=max_tokens,
+                stream=True,
+            )
+            body.update(await _resolve_split_chat_overlay(force_sync=attempt > 0))
+            try:
+                async with client.stream("POST", CHAT_URL, json=body, headers=headers) as response:
+                    if response.status_code != 200:
+                        detail = (await response.aread()).decode("utf-8", errors="replace")[:1200]
+                        if response.status_code == 400 and attempt == 0 and _should_resync_chat_overlay(detail):
+                            _clear_loaded_chat_overlay_path()
+                            continue
+                        if response.status_code >= 500 and _should_restart_backend(detail):
+                            _clear_loaded_chat_overlay_path()
+                            await _restart_service_if_needed(CHAT_SERVICE_NAME)
+                            raise HTTPException(
+                                status_code=503,
+                                detail=f"The {backend_label.lower()} crashed and is being restarted. Wait about 30 seconds, then try again.",
+                            )
+                        raise HTTPException(status_code=502, detail=f"{backend_label} error {response.status_code}: {detail}")
 
-                async for raw_payload in _aiter_sse_payloads(response):
-                    if raw_payload == "[DONE]":
-                        break
-                    try:
-                        payload = json.loads(raw_payload)
-                    except json.JSONDecodeError as exc:
-                        raise HTTPException(status_code=502, detail="Streaming backend returned invalid JSON") from exc
-                    if not isinstance(payload, dict):
-                        continue
-                    choices = payload.get("choices") or []
-                    if not choices or not isinstance(choices[0], dict):
-                        continue
-                    choice = choices[0]
-                    delta = choice.get("delta") or {}
-                    content = delta.get("content") or ""
-                    reasoning_content = delta.get("reasoning_content") or ""
-                    metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
-                    if content or reasoning_content or metrics:
-                        yield {
-                            "type": "delta",
-                            "content": content,
-                            "reasoning_content": reasoning_content,
-                            "metrics": metrics,
-                            "payload": payload,
-                        }
-                    finish_reason = choice.get("finish_reason")
-                    if finish_reason is not None:
-                        yield {
-                            "type": "finish",
-                            "finish_reason": finish_reason,
-                            "metrics": metrics,
-                            "payload": payload,
-                        }
-        except httpx.HTTPError as exc:
-            detail = str(exc)
-            if _should_restart_backend(detail):
-                await _restart_backend_if_needed()
-                raise HTTPException(
-                    status_code=503,
-                    detail="The training backend disconnected and is being restarted. Wait about 30 seconds, then try again.",
-                ) from exc
-            raise HTTPException(status_code=502, detail=f"Streaming backend connection error: {detail}") from exc
+                    async for raw_payload in _aiter_sse_payloads(response):
+                        if raw_payload == "[DONE]":
+                            break
+                        try:
+                            payload = json.loads(raw_payload)
+                        except json.JSONDecodeError as exc:
+                            raise HTTPException(status_code=502, detail="Streaming backend returned invalid JSON") from exc
+                        if not isinstance(payload, dict):
+                            continue
+                        choices = payload.get("choices") or []
+                        if not choices or not isinstance(choices[0], dict):
+                            continue
+                        choice = choices[0]
+                        delta = choice.get("delta") or {}
+                        content = delta.get("content") or ""
+                        reasoning_content = delta.get("reasoning_content") or ""
+                        metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
+                        if content or reasoning_content or metrics:
+                            yield {
+                                "type": "delta",
+                                "content": content,
+                                "reasoning_content": reasoning_content,
+                                "metrics": metrics,
+                                "payload": payload,
+                            }
+                        finish_reason = choice.get("finish_reason")
+                        if finish_reason is not None:
+                            yield {
+                                "type": "finish",
+                                "finish_reason": finish_reason,
+                                "metrics": metrics,
+                                "payload": payload,
+                            }
+                    return
+            except httpx.HTTPError as exc:
+                detail = str(exc)
+                if _should_restart_backend(detail):
+                    _clear_loaded_chat_overlay_path()
+                    await _restart_service_if_needed(CHAT_SERVICE_NAME)
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"The {backend_label.lower()} disconnected and is being restarted. Wait about 30 seconds, then try again.",
+                    ) from exc
+                raise HTTPException(status_code=502, detail=f"{backend_label} connection error: {detail}") from exc
 
 
 async def _proxy_feedback(
@@ -786,8 +1055,9 @@ async def _proxy_feedback(
         "note": note,
         "session_id": session_id,
     }
+    backend_label = _training_backend_label()
     headers = {
-        "Authorization": f"Bearer {API_KEY}",
+        "Authorization": f"Bearer {TRAINING_API_KEY}",
         "Content-Type": "application/json",
     }
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
@@ -796,21 +1066,21 @@ async def _proxy_feedback(
         except httpx.HTTPError as exc:
             detail = str(exc)
             if _should_restart_backend(detail):
-                await _restart_backend_if_needed()
+                await _restart_service_if_needed(TRAINING_SERVICE_NAME)
                 raise HTTPException(
                     status_code=503,
-                    detail="The training backend disconnected and is being restarted. Wait about 30 seconds, then try again.",
+                    detail=f"The {backend_label.lower()} disconnected and is being restarted. Wait about 30 seconds, then try again.",
                 ) from exc
-            raise HTTPException(status_code=502, detail=f"Training backend connection error: {detail}") from exc
+            raise HTTPException(status_code=502, detail=f"{backend_label} connection error: {detail}") from exc
         if response.status_code != 200:
             detail = response.text[:1200]
             if response.status_code >= 500 and _should_restart_backend(detail):
-                await _restart_backend_if_needed()
+                await _restart_service_if_needed(TRAINING_SERVICE_NAME)
                 raise HTTPException(
                     status_code=503,
-                    detail="The training backend crashed and is being restarted. Wait about 30 seconds, then try again.",
+                    detail=f"The {backend_label.lower()} crashed and is being restarted. Wait about 30 seconds, then try again.",
                 )
-            raise HTTPException(status_code=502, detail=f"Training backend error {response.status_code}: {detail}")
+            raise HTTPException(status_code=502, detail=f"{backend_label} error {response.status_code}: {detail}")
         try:
             payload = response.json()
         except ValueError as exc:
@@ -863,7 +1133,7 @@ async def _proxy_profiles() -> dict[str, Any]:
             "profiles": [],
         }
     headers = {
-        "Authorization": f"Bearer {API_KEY}",
+        "Authorization": f"Bearer {TRAINING_API_KEY}",
         "Content-Type": "application/json",
     }
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
@@ -884,7 +1154,7 @@ async def _proxy_profiles() -> dict[str, Any]:
 
 async def _proxy_create_profile(name: str) -> dict[str, Any]:
     headers = {
-        "Authorization": f"Bearer {API_KEY}",
+        "Authorization": f"Bearer {TRAINING_API_KEY}",
         "Content-Type": "application/json",
     }
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
@@ -905,7 +1175,7 @@ async def _proxy_create_profile(name: str) -> dict[str, Any]:
 
 async def _proxy_select_profile(profile_id: str) -> dict[str, Any]:
     headers = {
-        "Authorization": f"Bearer {API_KEY}",
+        "Authorization": f"Bearer {TRAINING_API_KEY}",
         "Content-Type": "application/json",
     }
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
@@ -935,9 +1205,11 @@ def _should_restart_backend(detail: str) -> bool:
     return any(marker in lowered for marker in markers)
 
 
-def _restart_backend() -> None:
+def _restart_service(service_name: str) -> None:
+    if not service_name:
+        return
     subprocess.run(
-        ["systemctl", "--user", "restart", RL_SERVICE_NAME],
+        ["systemctl", "--user", "restart", service_name],
         check=False,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -945,21 +1217,23 @@ def _restart_backend() -> None:
     )
 
 
-async def _restart_backend_if_needed() -> None:
-    global _last_backend_restart_at
-    now = time.time()
-    if now - _last_backend_restart_at < 30:
+async def _restart_service_if_needed(service_name: str) -> None:
+    if not service_name:
         return
-    _last_backend_restart_at = now
-    await asyncio.to_thread(_restart_backend)
+    now = time.time()
+    last_restart_at = _last_service_restart_at.get(service_name, 0.0)
+    if now - last_restart_at < 30:
+        return
+    _last_service_restart_at[service_name] = now
+    await asyncio.to_thread(_restart_service, service_name)
 
 
-async def _proxy_health() -> dict[str, Any]:
+async def _fetch_health(url: str) -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=5) as client:
         try:
-            response = await client.get(HEALTH_URL)
+            response = await client.get(url)
         except Exception as exc:  # pragma: no cover - surfaced in UI instead
-            return {"ok": False, "detail": str(exc)}
+            return {"ok": False, "detail": str(exc), "url": url}
 
     try:
         payload = response.json()
@@ -967,13 +1241,28 @@ async def _proxy_health() -> dict[str, Any]:
         payload = {
             "ok": response.status_code == 200,
             "detail": {"status_code": response.status_code, "body": response.text[:300]},
+            "url": url,
         }
 
     if isinstance(payload, dict):
         payload.setdefault("ok", response.status_code == 200)
+        payload.setdefault("url", url)
         return payload
 
-    return {"ok": response.status_code == 200, "detail": {"status_code": response.status_code}}
+    return {"ok": response.status_code == 200, "detail": {"status_code": response.status_code}, "url": url}
+
+
+async def _proxy_health() -> dict[str, Any]:
+    chat_health = await _fetch_health(CHAT_HEALTH_URL)
+    if not _is_split_backend():
+        return chat_health
+
+    training_health = await _fetch_health(TRAINING_HEALTH_URL)
+    return {
+        "ok": bool(chat_health.get("ok")) and bool(training_health.get("ok")),
+        "chat": chat_health,
+        "training": training_health,
+    }
 
 
 @app.get("/")
@@ -1169,6 +1458,9 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
         final_text = ""
         final_reasoning = ""
         last_metrics: dict[str, Any] | None = None
+        finish_reason = "stop"
+        streamed_raw_text = ""
+        structured_visible_thinking = thinking_enabled and not USE_NATIVE_CHAT_THINKING and not FORCE_NO_THINK
         requested_max_tokens = UI_THINKING_MAX_TOKENS if thinking_enabled else UI_MAX_TOKENS
 
         try:
@@ -1198,10 +1490,21 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
                 if event["type"] == "delta":
                     delta = str(event.get("content") or "")
                     reasoning_delta = str(event.get("reasoning_content") or "")
-                    if delta:
-                        final_text += delta
-                    if reasoning_delta:
-                        final_reasoning += reasoning_delta
+                    if structured_visible_thinking:
+                        if delta:
+                            streamed_raw_text += delta
+                        next_reasoning, next_visible = _split_visible_thinking_response(streamed_raw_text, final=False)
+                        reasoning_delta = (
+                            next_reasoning[len(final_reasoning) :] if next_reasoning.startswith(final_reasoning) else next_reasoning
+                        )
+                        delta = next_visible[len(final_text) :] if next_visible.startswith(final_text) else next_visible
+                        final_reasoning = next_reasoning
+                        final_text = next_visible
+                    else:
+                        if delta:
+                            final_text += delta
+                        if reasoning_delta:
+                            final_reasoning += reasoning_delta
                     if not delta and not reasoning_delta and not metrics:
                         continue
                     yield _sse_event(
@@ -1216,21 +1519,67 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
                     continue
 
                 if event["type"] == "finish":
+                    finish_reason = str(event.get("finish_reason") or "stop")
+
+            if structured_visible_thinking:
+                assistant_reasoning, assistant_text = _split_visible_thinking_response(streamed_raw_text, final=True)
+                assistant_reasoning = assistant_reasoning.strip()
+                assistant_text = assistant_text.strip()
+            else:
+                assistant_reasoning = final_reasoning.strip()
+                assistant_text = _resolve_assistant_text(final_text, assistant_reasoning)
+            needs_reasoning_backfill = structured_visible_thinking and bool(assistant_text) and not assistant_reasoning
+            if needs_reasoning_backfill or (not assistant_text and not assistant_reasoning):
+                fallback_response = await _proxy_chat(
+                    messages=prompt_messages,
+                    session_id=training_session_id,
+                    turn_type="main",
+                    session_done=False,
+                    thinking_enabled=thinking_enabled,
+                    max_tokens=requested_max_tokens,
+                )
+                choice = (fallback_response.get("choices") or [{}])[0]
+                assistant_message = choice.get("message") or {}
+                raw_assistant_content = str(assistant_message.get("content") or "")
+                if structured_visible_thinking:
+                    assistant_reasoning, assistant_text = _split_visible_thinking_response(raw_assistant_content, final=True)
+                    assistant_reasoning = assistant_reasoning.strip()
+                    assistant_text = assistant_text.strip()
+                else:
+                    assistant_reasoning = str(assistant_message.get("reasoning_content") or "").strip()
+                    assistant_text = _resolve_assistant_text(raw_assistant_content, assistant_reasoning)
+
+                delta = assistant_text[len(final_text) :] if assistant_text.startswith(final_text) else assistant_text
+                reasoning_delta = (
+                    assistant_reasoning[len(final_reasoning) :]
+                    if assistant_reasoning.startswith(final_reasoning)
+                    else assistant_reasoning
+                )
+                final_text = assistant_text
+                final_reasoning = assistant_reasoning
+
+                if delta or reasoning_delta:
                     yield _sse_event(
-                        "final",
+                        "delta",
                         {
                             "assistant_turn_id": assistant_turn["id"],
-                            "finish_reason": event.get("finish_reason", "stop"),
-                            "metrics": metrics,
+                            "delta": delta,
+                            "reasoning_delta": reasoning_delta,
+                            "metrics": last_metrics or {},
                         },
                     )
 
-            assistant_text = final_text.strip()
-            assistant_reasoning = final_reasoning.strip()
-            if not assistant_text and assistant_reasoning:
-                assistant_text = assistant_reasoning
-            if not assistant_text:
+            if not assistant_text and not assistant_reasoning:
                 raise HTTPException(status_code=502, detail="Model returned an empty response")
+
+            yield _sse_event(
+                "final",
+                {
+                    "assistant_turn_id": assistant_turn["id"],
+                    "finish_reason": finish_reason,
+                    "metrics": last_metrics or {},
+                },
+            )
 
             completed_assistant_turn = {
                 **assistant_turn,
@@ -1332,8 +1681,15 @@ async def api_chat(request: Request, body: ChatRequest) -> JSONResponse:
         )
         choice = (proxy_response.get("choices") or [{}])[0]
         assistant_message = choice.get("message") or {}
-        assistant_text = _assistant_text(assistant_message)
-        if not assistant_text:
+        raw_assistant_content = str(assistant_message.get("content") or "")
+        if thinking_enabled and not USE_NATIVE_CHAT_THINKING and not FORCE_NO_THINK:
+            assistant_reasoning, assistant_text = _split_visible_thinking_response(raw_assistant_content, final=True)
+            assistant_reasoning = assistant_reasoning.strip()
+            assistant_text = assistant_text.strip()
+        else:
+            assistant_reasoning = (assistant_message.get("reasoning_content") or "").strip()
+            assistant_text = _resolve_assistant_text(raw_assistant_content, assistant_reasoning)
+        if not assistant_text and not assistant_reasoning:
             raise HTTPException(status_code=502, detail="Model returned an empty response")
 
         user_turn = {
@@ -1349,7 +1705,7 @@ async def api_chat(request: Request, body: ChatRequest) -> JSONResponse:
             "created_at": time.time(),
             "feedback": None,
             "feedback_pending": True,
-            "reasoning": (assistant_message.get("reasoning_content") or "").strip(),
+            "reasoning": assistant_reasoning,
             "thinking_enabled": thinking_enabled,
             "metrics": None,
         }
@@ -1421,7 +1777,7 @@ async def api_feedback(request: Request, body: FeedbackRequest) -> JSONResponse:
         sentiment = "neutral"
 
     try:
-        if BACKEND_MODE == "rl_proxy":
+        if TRAINING_BACKEND_MODE == "rl_proxy":
             messages = list(pending_episode["prompt_messages"]) + [
                 pending_episode["assistant_message"],
                 {"role": "user", "content": feedback_message},
@@ -1431,9 +1787,10 @@ async def api_feedback(request: Request, body: FeedbackRequest) -> JSONResponse:
                 session_id=pending_episode["training_session_id"],
                 turn_type="main",
                 session_done=True,
+                thinking_enabled=False,
                 max_tokens=16,
             )
-        elif BACKEND_MODE == "trainer_api":
+        elif TRAINING_BACKEND_MODE == "trainer_api":
             await _proxy_feedback(
                 messages=list(pending_episode["prompt_messages"]),
                 assistant_response=pending_episode["assistant_message"]["content"],

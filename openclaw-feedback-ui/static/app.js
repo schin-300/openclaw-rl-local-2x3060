@@ -5,24 +5,23 @@ const state = {
   busy: false,
   model: "",
   backendMode: "rl_proxy",
+  chatBackendMode: "rl_proxy",
+  trainingBackendMode: "rl_proxy",
   proxyBaseUrl: "",
+  trainingProxyBaseUrl: "",
   proxyOk: null,
+  proxyHealth: null,
   guidanceText: "",
   thinkingEnabled: false,
   activeProfileId: "",
   profiles: [],
-  openApps: {
-    chat: false,
-    notes: false,
-    settings: false,
-  },
-  activeApp: "",
+  activePanel: "",
 };
 
 const feedbackDrafts = new Map();
 
 const els = {
-  desktopShell: document.querySelector(".desktop-shell"),
+  appShell: document.getElementById("app-shell"),
   transcript: document.getElementById("transcript"),
   emptyState: document.getElementById("empty-state"),
   sendButton: document.getElementById("send-button"),
@@ -38,8 +37,6 @@ const els = {
   newSessionButton: document.getElementById("new-session-button"),
   sessionList: document.getElementById("session-list"),
   sessionsEmpty: document.getElementById("sessions-empty"),
-  desktopClock: document.getElementById("desktop-clock"),
-  taskbarNetwork: document.getElementById("taskbar-network"),
   notesProfileLabel: document.getElementById("notes-profile-label"),
   settingsActiveProfile: document.getElementById("settings-active-profile"),
   chatActiveProfile: document.getElementById("chat-active-profile"),
@@ -48,18 +45,10 @@ const els = {
   profileCreateStatus: document.getElementById("profile-create-status"),
   profilesList: document.getElementById("profiles-list"),
   profilesEmpty: document.getElementById("profiles-empty"),
-  openAppButtons: Array.from(document.querySelectorAll("[data-open-app]")),
-  appLaunchers: Array.from(document.querySelectorAll("[data-app-launch]")),
-  appWindows: Array.from(document.querySelectorAll("[data-window]")),
-  taskbarApps: Array.from(document.querySelectorAll("[data-task-app]")),
-  windowActions: Array.from(document.querySelectorAll("[data-window-action]")),
+  panelToggleButtons: Array.from(document.querySelectorAll("[data-panel-toggle]")),
+  utilityPanels: Array.from(document.querySelectorAll("[data-panel]")),
+  panelCloseButtons: Array.from(document.querySelectorAll("[data-panel-close]")),
   messageTemplate: document.getElementById("message-template"),
-};
-
-const APP_DEFINITIONS = {
-  chat: { hasWindow: true, label: "local-chat.exe" },
-  notes: { hasWindow: true, label: "notes.txt" },
-  settings: { hasWindow: true, label: "settings.cpl" },
 };
 
 function escapeHtml(text) {
@@ -80,6 +69,62 @@ function renderMarkdownLite(text) {
     return `<p>${lines}</p>`;
   });
   return blocks.join("");
+}
+
+function extractFinalAnswer(text) {
+  const cleanText = String(text || "").trim();
+  if (!cleanText) {
+    return "";
+  }
+
+  const patterns = [
+    /(?:^|\n)\s*(?:Final Answer|Final Response|Answer|Response|Construct Response|Output)\s*:\s*(.+)/gi,
+    /(?:^|\n)\s*\*+\s*(?:Final Answer|Final Response|Answer|Response|Construct Response|Output)\s*:\s*(.+)/gi,
+  ];
+
+  let candidate = "";
+  for (const pattern of patterns) {
+    let match = pattern.exec(cleanText);
+    while (match) {
+      candidate = String(match[1] || "").trim();
+      match = pattern.exec(cleanText);
+    }
+    if (candidate) {
+      break;
+    }
+  }
+
+  return candidate.replace(/^["']+|["']+$/g, "").trim();
+}
+
+function looksLikeReasoningLeak(content, reasoning = "") {
+  const cleanContent = String(content || "").trim();
+  const cleanReasoning = String(reasoning || "").trim();
+  if (!cleanContent) {
+    return false;
+  }
+  if (cleanReasoning && cleanContent === cleanReasoning) {
+    return true;
+  }
+  if (/^thinking process:/i.test(cleanContent)) {
+    return true;
+  }
+  return Boolean(cleanReasoning) && /(analyze the request|final decision|construct response|instruction priority)/i.test(cleanContent);
+}
+
+function getDisplayMessageContent(item) {
+  const content = String(item.content || "").trim();
+  const reasoning = String(item.reasoning || "").trim();
+  if (item.role !== "assistant") {
+    return content;
+  }
+  if (!reasoning) {
+    return content;
+  }
+  if (!content || looksLikeReasoningLeak(content, reasoning)) {
+    return extractFinalAnswer(reasoning);
+  }
+  return content;
 }
 
 function getActiveProfile() {
@@ -336,7 +381,10 @@ function renderSessions() {
 
     const preview = document.createElement("p");
     preview.className = "session-preview";
-    preview.textContent = session.preview || "No messages yet.";
+    const previewText = String(session.preview || "").trim();
+    preview.textContent = previewText
+      ? looksLikeReasoningLeak(previewText) ? extractFinalAnswer(previewText) || "Thinking trace only." : previewText
+      : "No messages yet.";
 
     button.append(titleRow, preview);
     els.sessionList.appendChild(button);
@@ -348,8 +396,15 @@ function renderStatus() {
     return;
   }
 
-  const backendLabel =
-    state.backendMode === "rl_proxy"
+  const splitMode =
+    state.backendMode === "split_trainer_api" ||
+    state.backendMode === "split_backends" ||
+    state.backendMode === "sglang_trainer" ||
+    state.chatBackendMode !== state.trainingBackendMode ||
+    state.trainingProxyBaseUrl !== state.proxyBaseUrl;
+  const backendLabel = splitMode
+    ? "SGLang chat + trainer"
+    : state.backendMode === "rl_proxy"
       ? "Proxy"
       : state.backendMode === "trainer_api"
         ? "Trainer"
@@ -359,26 +414,29 @@ function renderStatus() {
 
   if (state.proxyOk === null) {
     els.proxyStatus.textContent = `Checking ${backendLabel.toLowerCase()}...`;
-    if (els.taskbarNetwork) {
-      els.taskbarNetwork.textContent = "Link check";
-    }
     return;
   }
 
   if (state.proxyOk) {
     els.proxyStatus.textContent = `${backendLabel} connected`;
     els.proxyStatus.classList.add("status-good");
-    if (els.taskbarNetwork) {
-      els.taskbarNetwork.textContent = "Local online";
-    }
     return;
   }
 
-  els.proxyStatus.textContent = `${backendLabel} unavailable`;
-  els.proxyStatus.classList.add("status-bad");
-  if (els.taskbarNetwork) {
-    els.taskbarNetwork.textContent = "Link offline";
+  if (splitMode && state.proxyHealth) {
+    const chatOk = Boolean(state.proxyHealth.chat?.ok);
+    const trainingOk = Boolean(state.proxyHealth.training?.ok);
+    if (!chatOk && trainingOk) {
+      els.proxyStatus.textContent = "SGLang unavailable";
+    } else if (chatOk && !trainingOk) {
+      els.proxyStatus.textContent = "Trainer unavailable";
+    } else {
+      els.proxyStatus.textContent = `${backendLabel} unavailable`;
+    }
+  } else {
+    els.proxyStatus.textContent = `${backendLabel} unavailable`;
   }
+  els.proxyStatus.classList.add("status-bad");
 }
 
 function renderControls() {
@@ -394,7 +452,11 @@ function renderControls() {
     els.windowModelTitle.textContent = state.model || "Local Chat";
   }
   if (els.windowModelEyebrow) {
-    els.windowModelEyebrow.textContent = state.model ? "CONNECTED MODEL" : "LOCAL CHAT";
+    const splitMode =
+      state.backendMode === "split_trainer_api" ||
+      state.backendMode === "split_backends" ||
+      state.backendMode === "sglang_trainer";
+    els.windowModelEyebrow.textContent = splitMode ? "SGLANG CHAT + LIVE TRAINER" : state.model ? "CONNECTED MODEL" : "LIVE RL CHAT";
   }
   if (els.thinkingToggle) {
     els.thinkingToggle.disabled = disabled;
@@ -461,7 +523,16 @@ function renderTranscript() {
     }
 
     roleLabel.textContent = item.role === "assistant" ? "Assistant" : "You";
-    body.innerHTML = renderMarkdownLite(item.content || "");
+    const displayContent = getDisplayMessageContent(item);
+    if (item.role === "assistant" && !displayContent && item.reasoning) {
+      if (item.streaming) {
+        body.innerHTML = "";
+      } else {
+        body.innerHTML = '<p class="assistant-placeholder-copy">Final answer missing. Open Thinking to inspect the reasoning trace.</p>';
+      }
+    } else {
+      body.innerHTML = renderMarkdownLite(displayContent);
+    }
 
     if (item.reasoning) {
       reasoningBlock.classList.remove("hidden");
@@ -545,7 +616,10 @@ function applyServerState(serverState, proxyState = null, profilePayload = null)
   document.body.classList.toggle("busy", state.busy);
   state.model = serverState.model || "";
   state.backendMode = serverState.backend_mode || "rl_proxy";
+  state.chatBackendMode = serverState.chat_backend_mode || state.backendMode;
+  state.trainingBackendMode = serverState.training_backend_mode || state.backendMode;
   state.proxyBaseUrl = serverState.proxy_base_url || "";
+  state.trainingProxyBaseUrl = serverState.training_proxy_base_url || state.proxyBaseUrl || "";
   state.activeProfileId = serverState.active_profile_id || state.activeProfileId || "";
   state.activeSessionId = serverState.active_session_id || "";
   state.sessions = Array.isArray(serverState.sessions) ? serverState.sessions : [];
@@ -563,6 +637,7 @@ function applyServerState(serverState, proxyState = null, profilePayload = null)
   );
 
   if (proxyState) {
+    state.proxyHealth = proxyState;
     state.proxyOk = Boolean(proxyState.ok);
   }
 
@@ -575,7 +650,7 @@ function applyServerState(serverState, proxyState = null, profilePayload = null)
   } else {
     updateProfileLabels();
   }
-  syncAppChrome();
+  syncUtilityPanels();
 }
 
 async function fetchJson(url, options = {}) {
@@ -857,7 +932,7 @@ async function createProfile() {
     setGuidanceStatus(
       payload.state.guidance_text
         ? "Saved notes loaded for the new profile."
-        : "New profile created. Add notes in notes.txt when you want."
+        : "New profile created. Add steering notes whenever you want."
     );
     setProfileCreateStatus("Profile created and activated.");
   } catch (error) {
@@ -926,78 +1001,39 @@ async function selectSession(sessionId) {
   }
 }
 
-function updateDesktopClock() {
-  if (!els.desktopClock) {
-    return;
-  }
-  const now = new Date();
-  els.desktopClock.textContent = now.toLocaleTimeString([], {
-    hour: "numeric",
-    minute: "2-digit",
-  });
-}
-
-function getWindowByApp(appName) {
-  return els.appWindows.find((item) => item.dataset.window === appName) || null;
-}
-
-function setDesktopSelection(appName) {
-  for (const launcher of els.appLaunchers) {
-    launcher.classList.toggle("active", launcher.dataset.appLaunch === appName);
-  }
-}
-
-function syncAppChrome() {
-  const anyOpen = Object.values(state.openApps).some(Boolean);
-  if (els.desktopShell) {
-    els.desktopShell.classList.toggle("app-open", anyOpen);
+function syncUtilityPanels() {
+  const activePanel = state.activePanel;
+  if (els.appShell) {
+    els.appShell.classList.toggle("panel-open", Boolean(activePanel));
   }
 
-  for (const appName of Object.keys(APP_DEFINITIONS)) {
-    const appWindow = getWindowByApp(appName);
-    if (appWindow) {
-      appWindow.classList.toggle("window-hidden", !state.openApps[appName]);
-    }
+  for (const panel of els.utilityPanels) {
+    const isActive = panel.dataset.panel === activePanel;
+    panel.classList.toggle("hidden", !isActive);
+    panel.setAttribute("aria-hidden", isActive ? "false" : "true");
   }
 
-  for (const button of els.taskbarApps) {
-    const appName = button.dataset.taskApp;
-    const isActive = state.activeApp === appName;
-    const isOpen = Boolean(state.openApps[appName]);
+  for (const button of els.panelToggleButtons) {
+    const isActive = button.dataset.panelToggle === activePanel;
     button.classList.toggle("active", isActive);
-    button.classList.toggle("open-pill", isOpen && !isActive);
-    button.classList.toggle("inactive-pill", !isOpen);
+    button.setAttribute("aria-pressed", isActive ? "true" : "false");
   }
 }
 
-function openApp(appName) {
-  const definition = APP_DEFINITIONS[appName];
-  if (!definition) {
+function togglePanel(panelName) {
+  if (!panelName) {
     return;
   }
-  setDesktopSelection(appName);
-  if (!definition.hasWindow) {
-    window.alert(`${definition.label} is not installed yet. The desktop shell is ready for more apps later.`);
-    return;
-  }
-  for (const otherName of Object.keys(APP_DEFINITIONS)) {
-    state.openApps[otherName] = false;
-  }
-  state.openApps[appName] = true;
-  state.activeApp = appName;
-  syncAppChrome();
+  state.activePanel = state.activePanel === panelName ? "" : panelName;
+  syncUtilityPanels();
 }
 
-function closeApp(appName) {
-  if (!APP_DEFINITIONS[appName]) {
+function closePanel(panelName) {
+  if (!panelName || state.activePanel !== panelName) {
     return;
   }
-  if (appName !== "chat") {
-    openApp("chat");
-    return;
-  }
-  openApp("chat");
-  return;
+  state.activePanel = "";
+  syncUtilityPanels();
 }
 
 els.sendButton.addEventListener("click", sendPrompt);
@@ -1039,44 +1075,21 @@ if (els.profileNameInput) {
   });
 }
 
-for (const launcher of els.appLaunchers) {
-  launcher.addEventListener("click", () => {
-    setDesktopSelection(launcher.dataset.appLaunch);
-  });
-  launcher.addEventListener("dblclick", () => {
-    openApp(launcher.dataset.appLaunch);
+for (const button of els.panelToggleButtons) {
+  button.addEventListener("click", () => {
+    togglePanel(button.dataset.panelToggle);
   });
 }
 
-for (const taskbarButton of els.taskbarApps) {
-  taskbarButton.addEventListener("click", () => {
-    openApp(taskbarButton.dataset.taskApp);
+for (const button of els.panelCloseButtons) {
+  button.addEventListener("click", () => {
+    closePanel(button.dataset.panelClose);
   });
 }
 
-for (const appButton of els.openAppButtons) {
-  appButton.addEventListener("click", () => {
-    openApp(appButton.dataset.openApp);
-  });
-}
-
-for (const actionButton of els.windowActions) {
-  actionButton.addEventListener("click", () => {
-    const targetWindow = actionButton.dataset.targetWindow;
-    const action = actionButton.dataset.windowAction;
-    if (action === "close" || action === "minimize") {
-      closeApp(targetWindow);
-      return;
-    }
-    openApp(targetWindow);
-  });
-}
-
-updateDesktopClock();
-window.setInterval(updateDesktopClock, 30000);
-openApp("chat");
 setProfileCreateStatus("Create a new saved training profile.");
 autoResizeComposer();
+syncUtilityPanels();
 
 refreshState().catch((error) => {
   state.proxyOk = false;
