@@ -8,6 +8,34 @@ SGLANG_VENV="${QWEN35_SGLANG_VENV:-${REPO_ROOT}/.venv}"
 QWEN35_VENV="${QWEN35_RUNTIME_VENV:-${REPO_ROOT}/.venv-qwen35}"
 OVERLAY_DIR="${QWEN35_SGLANG_OVERLAY_DIR:-${REPO_ROOT}/.sglang-qwen35-overlay}"
 ENABLE_OVERLAY="${QWEN35_SGLANG_ENABLE_OVERLAY:-0}"
+PATCH_SOURCE="${QWEN35_SGLANG_PATCH_SOURCE:-${SCRIPT_DIR}/sglang_patches/qwen3_5.py}"
+SYNC_PATCH="${QWEN35_SGLANG_SYNC_PATCH:-1}"
+
+sync_repo_managed_qwen35_patch() {
+  local target_path
+
+  if [[ ! "${SYNC_PATCH,,}" =~ ^(1|true|yes|on)$ ]]; then
+    return 0
+  fi
+
+  if [[ ! -f "${PATCH_SOURCE}" ]]; then
+    echo "Missing repo-managed SGLang patch file: ${PATCH_SOURCE}" >&2
+    return 1
+  fi
+
+  target_path="$(find "${SGLANG_VENV}/lib" -maxdepth 6 -type f -path '*/site-packages/sglang/srt/models/qwen3_5.py' | head -n1)"
+  if [[ -z "${target_path}" ]]; then
+    echo "Could not find sglang/srt/models/qwen3_5.py under ${SGLANG_VENV}" >&2
+    return 1
+  fi
+
+  if cmp -s "${PATCH_SOURCE}" "${target_path}"; then
+    return 0
+  fi
+
+  install -m 0644 "${PATCH_SOURCE}" "${target_path}"
+  echo "Synced repo-managed Qwen3.5 SGLang patch to ${target_path}" >&2
+}
 
 if [[ "${ENABLE_OVERLAY,,}" =~ ^(1|true|yes|on)$ ]]; then
   mkdir -p "${OVERLAY_DIR}"
@@ -46,6 +74,8 @@ export FLASHINFER_DISABLE_VERSION_CHECK="${FLASHINFER_DISABLE_VERSION_CHECK:-1}"
 if [[ "${ENABLE_OVERLAY,,}" =~ ^(1|true|yes|on)$ ]]; then
   export PYTHONPATH="${OVERLAY_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 fi
+
+sync_repo_managed_qwen35_patch
 
 MODEL_ID="${QWEN35_SGLANG_MODEL_ID:-Qwen/Qwen3.5-4B}"
 SERVED_MODEL_NAME="${QWEN35_SGLANG_SERVED_MODEL_NAME:-qwen3.5-4b-local}"

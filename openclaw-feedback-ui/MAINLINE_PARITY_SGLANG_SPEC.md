@@ -64,6 +64,9 @@ Implementation notes:
 
 - SGLang needed a local `qwen3_5.py` LoRA shape fix so the live adapter could
   load correctly for `Qwen3.5-4B`.
+- `main` now vendors that working `qwen3_5.py` patch and the SGLang launcher
+  syncs it into the active venv before startup, so the live path no longer
+  depends on an undocumented manual edit.
 - The UI now only requests separated reasoning from SGLang when native chat
   thinking is actually enabled.
 - The streaming path has an empty-stream rescue that falls back to the

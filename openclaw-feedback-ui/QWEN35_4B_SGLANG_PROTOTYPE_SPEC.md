@@ -47,6 +47,8 @@ As of `2026-03-22`, the requested target is live and verified locally:
 
 1. The local SGLang install needed a `qwen3_5` LoRA hidden-dimension fix in the
    model implementation so the Qwen3.5-4B adapter could load without crashing.
+   `main` now carries that patched file in `qwen35-experimental/sglang_patches/`
+   and the SGLang launcher syncs it into the active venv on startup.
 2. The UI now avoids requesting separated reasoning from SGLang unless native
    SGLang thinking is intentionally enabled.
 3. The stream adapter has a non-stream rescue path for rare cases where the
