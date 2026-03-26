@@ -908,9 +908,15 @@ function buildTranscriptMessage(item) {
   if (item.role === "assistant" && !displayContent && item.reasoning) {
     if (item.streaming) {
       body.innerHTML = "";
+    } else if (item.stopped) {
+      body.innerHTML =
+        '<p class="assistant-placeholder-copy">Generation stopped before a final answer was produced. Open Thinking to inspect the partial trace.</p>';
     } else {
       body.innerHTML = '<p class="assistant-placeholder-copy">Final answer missing. Open Thinking to inspect the reasoning trace.</p>';
     }
+  } else if (item.role === "assistant" && !displayContent && item.stopped) {
+    body.innerHTML =
+      '<p class="assistant-placeholder-copy">Generation stopped before any visible answer was produced.</p>';
   } else {
     body.innerHTML = renderMarkdownLite(displayContent);
   }
