@@ -17,14 +17,47 @@ const state = {
   thinkingEnabled: false,
   activeProfileId: "",
   profiles: [],
-  activePanel: "",
+  activeApp: "chat",
+  calendarMonthAnchor: "",
+  calendarSelectedDateKey: "",
+  calendarEvents: {},
 };
 
 const feedbackDrafts = new Map();
 let activeStreamController = null;
+const ACTIVE_APP_STORAGE_KEY = "openclaw_os_active_app_v1";
+const CALENDAR_STORAGE_KEY = "openclaw_os_calendar_v1";
+const APP_REGISTRY = {
+  chat: {
+    id: "chat",
+    title: "OpenClaw Chat",
+    eyebrow: "LIVE RL CHAT",
+    summary: "Stay in the feedback loop, stream replies live, and keep your training flow intact.",
+  },
+  calendar: {
+    id: "calendar",
+    title: "Calendar",
+    eyebrow: "OPENCLAW OS APP",
+    summary: "A simple local planning surface that lives beside the chat instead of kicking you out of it.",
+  },
+  notes: {
+    id: "notes",
+    title: "Notes",
+    eyebrow: "PROFILE MEMORY",
+    summary: "Shape the active profile with a lightweight system prompt and steering notes.",
+  },
+  profiles: {
+    id: "profiles",
+    title: "Profiles",
+    eyebrow: "TRAINING TRACKS",
+    summary: "Switch between saved chats, notes, system prompts, and learned state.",
+  },
+};
 
 const els = {
   appShell: document.getElementById("app-shell"),
+  appViews: Array.from(document.querySelectorAll("[data-app-view]")),
+  appLauncherButtons: Array.from(document.querySelectorAll("[data-open-app]")),
   transcript: document.getElementById("transcript"),
   emptyState: document.getElementById("empty-state"),
   sendButton: document.getElementById("send-button"),
@@ -38,6 +71,7 @@ const els = {
   modelLabel: document.getElementById("model-label"),
   windowModelTitle: document.getElementById("window-model-title"),
   windowModelEyebrow: document.getElementById("window-model-eyebrow"),
+  windowAppSummary: document.getElementById("window-app-summary"),
   thinkingToggle: document.getElementById("thinking-toggle"),
   newSessionButton: document.getElementById("new-session-button"),
   sessionList: document.getElementById("session-list"),
@@ -50,11 +84,101 @@ const els = {
   profileCreateStatus: document.getElementById("profile-create-status"),
   profilesList: document.getElementById("profiles-list"),
   profilesEmpty: document.getElementById("profiles-empty"),
-  panelToggleButtons: Array.from(document.querySelectorAll("[data-panel-toggle]")),
-  utilityPanels: Array.from(document.querySelectorAll("[data-panel]")),
-  panelCloseButtons: Array.from(document.querySelectorAll("[data-panel-close]")),
+  calendarGrid: document.getElementById("calendar-grid"),
+  calendarMonthLabel: document.getElementById("calendar-month-label"),
+  calendarSelectedLabel: document.getElementById("calendar-selected-label"),
+  calendarSelectedMeta: document.getElementById("calendar-selected-meta"),
+  calendarDayEvents: document.getElementById("calendar-day-events"),
+  calendarEventTitle: document.getElementById("calendar-event-title"),
+  calendarEventNote: document.getElementById("calendar-event-note"),
+  calendarSaveButton: document.getElementById("calendar-save-button"),
+  calendarClearButton: document.getElementById("calendar-clear-button"),
+  calendarPrevMonth: document.getElementById("calendar-prev-month"),
+  calendarNextMonth: document.getElementById("calendar-next-month"),
   messageTemplate: document.getElementById("message-template"),
 };
+
+function todayDateKey() {
+  return formatDateKey(new Date());
+}
+
+function formatDateKey(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  const year = date.getFullYear();
+  const month = `${date.getMonth() + 1}`.padStart(2, "0");
+  const day = `${date.getDate()}`.padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function parseDateKey(dateKey) {
+  const [year, month, day] = String(dateKey || "")
+    .split("-")
+    .map((value) => Number(value));
+  if (!year || !month || !day) {
+    return new Date();
+  }
+  return new Date(year, month - 1, day);
+}
+
+function startOfMonth(date) {
+  return new Date(date.getFullYear(), date.getMonth(), 1);
+}
+
+function loadActiveApp() {
+  const saved = window.localStorage.getItem(ACTIVE_APP_STORAGE_KEY);
+  return APP_REGISTRY[saved] ? saved : "chat";
+}
+
+function saveActiveApp() {
+  window.localStorage.setItem(ACTIVE_APP_STORAGE_KEY, state.activeApp);
+}
+
+function loadCalendarState() {
+  const today = new Date();
+  const fallback = {
+    calendarMonthAnchor: formatDateKey(startOfMonth(today)),
+    calendarSelectedDateKey: todayDateKey(),
+    calendarEvents: {},
+  };
+
+  try {
+    const raw = window.localStorage.getItem(CALENDAR_STORAGE_KEY);
+    if (!raw) {
+      return fallback;
+    }
+    const parsed = JSON.parse(raw);
+    return {
+      calendarMonthAnchor:
+        typeof parsed.calendarMonthAnchor === "string" && parsed.calendarMonthAnchor
+          ? parsed.calendarMonthAnchor
+          : fallback.calendarMonthAnchor,
+      calendarSelectedDateKey:
+        typeof parsed.calendarSelectedDateKey === "string" && parsed.calendarSelectedDateKey
+          ? parsed.calendarSelectedDateKey
+          : fallback.calendarSelectedDateKey,
+      calendarEvents:
+        parsed.calendarEvents && typeof parsed.calendarEvents === "object" && !Array.isArray(parsed.calendarEvents)
+          ? parsed.calendarEvents
+          : fallback.calendarEvents,
+    };
+  } catch (_error) {
+    return fallback;
+  }
+}
+
+function saveCalendarState() {
+  window.localStorage.setItem(
+    CALENDAR_STORAGE_KEY,
+    JSON.stringify({
+      calendarMonthAnchor: state.calendarMonthAnchor,
+      calendarSelectedDateKey: state.calendarSelectedDateKey,
+      calendarEvents: state.calendarEvents,
+    })
+  );
+}
+
+state.activeApp = loadActiveApp();
+Object.assign(state, loadCalendarState());
 
 function escapeHtml(text) {
   return String(text || "")
@@ -334,6 +458,190 @@ function updateProfileLabels() {
   }
 }
 
+function getAppMeta(appId = state.activeApp) {
+  return APP_REGISTRY[appId] || APP_REGISTRY.chat;
+}
+
+function renderShell() {
+  const appMeta = getAppMeta();
+  const chatActive = state.activeApp === "chat";
+
+  if (els.windowModelEyebrow) {
+    els.windowModelEyebrow.textContent = appMeta.eyebrow;
+  }
+  if (els.windowModelTitle) {
+    els.windowModelTitle.textContent = appMeta.title;
+  }
+  if (els.windowAppSummary) {
+    els.windowAppSummary.textContent = appMeta.summary;
+  }
+  if (els.thinkingToggle) {
+    els.thinkingToggle.classList.toggle("hidden", !chatActive);
+  }
+  if (els.chatActiveProfile) {
+    els.chatActiveProfile.classList.toggle("hidden", state.activeApp === "calendar");
+  }
+
+  for (const button of els.appLauncherButtons) {
+    const isActive = button.dataset.openApp === state.activeApp;
+    button.classList.toggle("active", isActive);
+    button.setAttribute("aria-pressed", isActive ? "true" : "false");
+  }
+
+  for (const view of els.appViews) {
+    const isActive = view.dataset.appView === state.activeApp;
+    view.classList.toggle("hidden", !isActive);
+    view.setAttribute("aria-hidden", isActive ? "false" : "true");
+  }
+}
+
+function activateApp(appId) {
+  if (!APP_REGISTRY[appId]) {
+    return;
+  }
+  state.activeApp = appId;
+  saveActiveApp();
+  renderShell();
+  if (appId === "calendar") {
+    renderCalendar();
+  }
+}
+
+function getCalendarEventsForDay(dateKey) {
+  const events = state.calendarEvents[dateKey];
+  return Array.isArray(events) ? events : [];
+}
+
+function renderCalendarSelectedDay() {
+  if (!els.calendarSelectedLabel || !els.calendarSelectedMeta || !els.calendarDayEvents) {
+    return;
+  }
+
+  const selectedDate = parseDateKey(state.calendarSelectedDateKey);
+  const dateKey = state.calendarSelectedDateKey;
+  const events = getCalendarEventsForDay(dateKey);
+
+  els.calendarSelectedLabel.textContent = selectedDate.toLocaleDateString([], {
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+  });
+  els.calendarSelectedMeta.textContent = `${events.length} event${events.length === 1 ? "" : "s"}`;
+  els.calendarDayEvents.innerHTML = "";
+
+  if (!events.length) {
+    const empty = document.createElement("div");
+    empty.className = "calendar-empty";
+    const copy = document.createElement("p");
+    copy.textContent = "No events saved for this day yet. Add one below to prove the shell is a real workspace.";
+    empty.appendChild(copy);
+    els.calendarDayEvents.appendChild(empty);
+    return;
+  }
+
+  for (const event of events) {
+    const card = document.createElement("article");
+    card.className = "calendar-event-card";
+    const title = document.createElement("h4");
+    title.textContent = event.title || "Untitled event";
+    const note = document.createElement("p");
+    note.textContent = event.note || "No extra notes.";
+    card.append(title, note);
+    els.calendarDayEvents.appendChild(card);
+  }
+}
+
+function renderCalendar() {
+  if (!els.calendarGrid || !els.calendarMonthLabel) {
+    return;
+  }
+
+  const anchor = startOfMonth(parseDateKey(state.calendarMonthAnchor));
+  const monthStart = startOfMonth(anchor);
+  const firstVisibleDate = new Date(monthStart);
+  firstVisibleDate.setDate(monthStart.getDate() - monthStart.getDay());
+
+  els.calendarMonthLabel.textContent = monthStart.toLocaleDateString([], {
+    month: "long",
+    year: "numeric",
+  });
+  els.calendarGrid.innerHTML = "";
+
+  const todayKey = todayDateKey();
+  for (let offset = 0; offset < 42; offset += 1) {
+    const date = new Date(firstVisibleDate);
+    date.setDate(firstVisibleDate.getDate() + offset);
+    const dateKey = formatDateKey(date);
+    const events = getCalendarEventsForDay(dateKey);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "calendar-day-button";
+    button.classList.toggle("outside-month", date.getMonth() !== monthStart.getMonth());
+    button.classList.toggle("selected", dateKey === state.calendarSelectedDateKey);
+    button.classList.toggle("today", dateKey === todayKey);
+    button.addEventListener("click", () => {
+      state.calendarSelectedDateKey = dateKey;
+      saveCalendarState();
+      renderCalendar();
+    });
+
+    const number = document.createElement("span");
+    number.className = "calendar-day-number";
+    number.textContent = String(date.getDate());
+    const count = document.createElement("span");
+    count.className = "calendar-day-note-count";
+    count.textContent = events.length ? `${events.length} saved` : "Open day";
+    button.append(number, count);
+    els.calendarGrid.appendChild(button);
+  }
+
+  renderCalendarSelectedDay();
+}
+
+function shiftCalendarMonth(offset) {
+  const currentAnchor = startOfMonth(parseDateKey(state.calendarMonthAnchor));
+  const nextAnchor = new Date(currentAnchor.getFullYear(), currentAnchor.getMonth() + offset, 1);
+  state.calendarMonthAnchor = formatDateKey(nextAnchor);
+  saveCalendarState();
+  renderCalendar();
+}
+
+function saveCalendarEvent() {
+  const title = String(els.calendarEventTitle?.value || "").trim();
+  const note = String(els.calendarEventNote?.value || "").trim();
+  if (!title && !note) {
+    return;
+  }
+
+  const nextEvents = [...getCalendarEventsForDay(state.calendarSelectedDateKey)];
+  nextEvents.push({
+    id: `${Date.now()}`,
+    title: title || "Untitled event",
+    note,
+  });
+  state.calendarEvents[state.calendarSelectedDateKey] = nextEvents;
+  saveCalendarState();
+  if (els.calendarEventTitle) {
+    els.calendarEventTitle.value = "";
+  }
+  if (els.calendarEventNote) {
+    els.calendarEventNote.value = "";
+  }
+  renderCalendar();
+}
+
+function clearCalendarDay() {
+  delete state.calendarEvents[state.calendarSelectedDateKey];
+  saveCalendarState();
+  if (els.calendarEventTitle) {
+    els.calendarEventTitle.value = "";
+  }
+  if (els.calendarEventNote) {
+    els.calendarEventNote.value = "";
+  }
+  renderCalendar();
+}
+
 function renderProfiles() {
   if (!els.profilesList || !els.profilesEmpty) {
     return;
@@ -533,16 +841,6 @@ function renderControls() {
   els.newSessionButton.disabled = disabled;
   const connectedModel = state.model || "Model";
   els.modelLabel.textContent = connectedModel;
-  if (els.windowModelTitle) {
-    els.windowModelTitle.textContent = state.model || "Local Chat";
-  }
-  if (els.windowModelEyebrow) {
-    const splitMode =
-      state.backendMode === "split_trainer_api" ||
-      state.backendMode === "split_backends" ||
-      state.backendMode === "sglang_trainer";
-    els.windowModelEyebrow.textContent = splitMode ? "SGLANG CHAT + LIVE TRAINER" : state.model ? "CONNECTED MODEL" : "LIVE RL CHAT";
-  }
   if (els.thinkingToggle) {
     els.thinkingToggle.disabled = disabled;
     els.thinkingToggle.classList.toggle("active", state.thinkingEnabled);
@@ -778,7 +1076,8 @@ function applyServerState(serverState, proxyState = null, profilePayload = null)
   } else {
     updateProfileLabels();
   }
-  syncUtilityPanels();
+  renderShell();
+  renderCalendar();
 }
 
 async function fetchJson(url, options = {}) {
@@ -1163,41 +1462,6 @@ async function selectSession(sessionId) {
   }
 }
 
-function syncUtilityPanels() {
-  const activePanel = state.activePanel;
-  if (els.appShell) {
-    els.appShell.classList.toggle("panel-open", Boolean(activePanel));
-  }
-
-  for (const panel of els.utilityPanels) {
-    const isActive = panel.dataset.panel === activePanel;
-    panel.classList.toggle("hidden", !isActive);
-    panel.setAttribute("aria-hidden", isActive ? "false" : "true");
-  }
-
-  for (const button of els.panelToggleButtons) {
-    const isActive = button.dataset.panelToggle === activePanel;
-    button.classList.toggle("active", isActive);
-    button.setAttribute("aria-pressed", isActive ? "true" : "false");
-  }
-}
-
-function togglePanel(panelName) {
-  if (!panelName) {
-    return;
-  }
-  state.activePanel = state.activePanel === panelName ? "" : panelName;
-  syncUtilityPanels();
-}
-
-function closePanel(panelName) {
-  if (!panelName || state.activePanel !== panelName) {
-    return;
-  }
-  state.activePanel = "";
-  syncUtilityPanels();
-}
-
 els.sendButton.addEventListener("click", () => {
   if (state.busy) {
     stopPrompt();
@@ -1249,21 +1513,36 @@ if (els.profileNameInput) {
   });
 }
 
-for (const button of els.panelToggleButtons) {
+for (const button of els.appLauncherButtons) {
   button.addEventListener("click", () => {
-    togglePanel(button.dataset.panelToggle);
+    activateApp(button.dataset.openApp);
   });
 }
 
-for (const button of els.panelCloseButtons) {
-  button.addEventListener("click", () => {
-    closePanel(button.dataset.panelClose);
+if (els.calendarPrevMonth) {
+  els.calendarPrevMonth.addEventListener("click", () => {
+    shiftCalendarMonth(-1);
   });
+}
+
+if (els.calendarNextMonth) {
+  els.calendarNextMonth.addEventListener("click", () => {
+    shiftCalendarMonth(1);
+  });
+}
+
+if (els.calendarSaveButton) {
+  els.calendarSaveButton.addEventListener("click", saveCalendarEvent);
+}
+
+if (els.calendarClearButton) {
+  els.calendarClearButton.addEventListener("click", clearCalendarDay);
 }
 
 setProfileCreateStatus("Create a new saved training profile.");
 autoResizeComposer();
-syncUtilityPanels();
+renderShell();
+renderCalendar();
 
 refreshState().catch((error) => {
   state.proxyOk = false;

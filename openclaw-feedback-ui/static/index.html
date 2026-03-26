@@ -3,156 +3,251 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>OpenClaw Live RL Chat</title>
+    <title>OpenClaw OS</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260326f" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260326g" />
   </head>
   <body>
     <div class="app-shell" id="app-shell">
-      <header class="app-header">
-        <div class="window-brand">
+      <aside class="launcher-rail" aria-label="OpenClaw OS app launcher">
+        <div class="launcher-brand">
           <div class="window-orb" aria-hidden="true"></div>
           <div class="brand-copy">
-            <p class="eyebrow" id="window-model-eyebrow">CONNECTED MODEL</p>
-            <h1 id="window-model-title">OpenClaw Live RL Chat</h1>
+            <p class="eyebrow">OPENCLAW OS</p>
+            <h1>Workspace</h1>
           </div>
         </div>
-        <div class="titlebar-meta">
-          <div class="status-chip" id="proxy-status">Checking trainer...</div>
-          <div class="model-pill" id="model-label">Model</div>
-          <button class="thinking-toggle" id="thinking-toggle" type="button" aria-pressed="false">Thinking off</button>
-          <div class="model-pill profile-pill" id="chat-active-profile">Default</div>
-          <div class="header-utility-actions">
-            <button class="header-utility-button mobile-only" data-panel-toggle="notes" type="button">Notes</button>
-            <button class="header-utility-button mobile-only" data-panel-toggle="settings" type="button">Profiles</button>
-          </div>
+
+        <nav class="launcher-nav">
+          <button class="launcher-app" data-open-app="chat" type="button">
+            <span class="launcher-icon" aria-hidden="true">◉</span>
+            <span class="launcher-label">Chat</span>
+          </button>
+          <button class="launcher-app" data-open-app="calendar" type="button">
+            <span class="launcher-icon" aria-hidden="true">▦</span>
+            <span class="launcher-label">Calendar</span>
+          </button>
+          <button class="launcher-app" data-open-app="notes" type="button">
+            <span class="launcher-icon" aria-hidden="true">✎</span>
+            <span class="launcher-label">Notes</span>
+          </button>
+          <button class="launcher-app" data-open-app="profiles" type="button">
+            <span class="launcher-icon" aria-hidden="true">◎</span>
+            <span class="launcher-label">Profiles</span>
+          </button>
+        </nav>
+
+        <div class="launcher-footer">
+          <p>Switch apps without dropping the active chat session.</p>
         </div>
-      </header>
+      </aside>
 
-      <main class="app-main">
-        <div class="chat-layout">
-          <aside class="chat-sidebar">
-            <div class="sidebar-head">
-              <h2>Chats</h2>
-              <button class="new-chat-button" id="new-session-button" type="button">+ New chat</button>
+      <div class="workspace-shell">
+        <header class="app-header">
+          <div class="window-brand">
+            <div class="window-orb" aria-hidden="true"></div>
+            <div class="brand-copy">
+              <p class="eyebrow" id="window-model-eyebrow">OPENCLAW OS</p>
+              <h1 id="window-model-title">OpenClaw Chat</h1>
+              <p class="workspace-summary" id="window-app-summary">
+                Keep the live RL chat open while you move through the rest of the workspace.
+              </p>
             </div>
-            <div class="session-list" id="session-list"></div>
-            <div class="sessions-empty hidden" id="sessions-empty">
-              Start a new chat to create the first saved conversation for this profile.
-            </div>
-            <div class="sidebar-footer">
-              <button class="sidebar-utility-button" data-panel-toggle="notes" type="button">Notes</button>
-              <button class="sidebar-utility-button" data-panel-toggle="settings" type="button">Profiles</button>
-            </div>
-          </aside>
+          </div>
+          <div class="titlebar-meta">
+            <div class="status-chip" id="proxy-status">Checking trainer...</div>
+            <div class="model-pill" id="model-label">Model</div>
+            <button class="thinking-toggle" id="thinking-toggle" type="button" aria-pressed="false">
+              Thinking off
+            </button>
+            <div class="model-pill profile-pill" id="chat-active-profile">Default</div>
+          </div>
+        </header>
 
-          <section class="chat-main">
-            <section class="transcript-shell">
-              <div class="transcript" id="transcript"></div>
-              <div class="empty-state" id="empty-state">
-                <div class="empty-orb" aria-hidden="true"></div>
-                <h2>Chat, stream, rate, repeat.</h2>
-                <p>
-                  Keep one clean chat flow: talk normally, let replies stream in live, then rate the turns that are
-                  worth training on.
-                </p>
-              </div>
-            </section>
+        <main class="app-main">
+          <section class="app-view chat-app-view" data-app-view="chat" aria-hidden="false">
+            <div class="chat-layout">
+              <aside class="chat-sidebar">
+                <div class="sidebar-head">
+                  <h2>Chats</h2>
+                  <button class="new-chat-button" id="new-session-button" type="button">+ New chat</button>
+                </div>
+                <div class="session-list" id="session-list"></div>
+                <div class="sessions-empty hidden" id="sessions-empty">
+                  Start a new chat to create the first saved conversation for this profile.
+                </div>
+                <div class="sidebar-footer">
+                  <button class="sidebar-utility-button" data-open-app="notes" type="button">Notes</button>
+                  <button class="sidebar-utility-button" data-open-app="profiles" type="button">Profiles</button>
+                  <button class="sidebar-utility-button" data-open-app="calendar" type="button">Calendar</button>
+                </div>
+              </aside>
 
-            <section class="composer-shell">
-              <div class="composer-frame">
-                <textarea id="prompt-input" rows="1" placeholder="Ask anything..."></textarea>
-                <button class="send-button" id="send-button" type="button" aria-label="Send message">
-                  <span class="send-button-icon" aria-hidden="true">&#10148;</span>
-                </button>
-              </div>
-            </section>
+              <section class="chat-main">
+                <section class="transcript-shell">
+                  <div class="transcript" id="transcript"></div>
+                  <div class="empty-state" id="empty-state">
+                    <div class="empty-orb" aria-hidden="true"></div>
+                    <h2>Chat, switch apps, come back.</h2>
+                    <p>
+                      The shell keeps your live RL chat intact while you move through Calendar, Notes, and Profiles.
+                    </p>
+                  </div>
+                </section>
+
+                <section class="composer-shell">
+                  <div class="composer-frame">
+                    <textarea id="prompt-input" rows="1" placeholder="Ask anything..."></textarea>
+                    <button class="send-button" id="send-button" type="button" aria-label="Send message">
+                      <span class="send-button-icon" aria-hidden="true">&#10148;</span>
+                    </button>
+                  </div>
+                </section>
+              </section>
+            </div>
           </section>
-        </div>
 
-        <aside class="utility-panel hidden" data-panel="notes" aria-hidden="true">
-          <div class="panel-head">
-            <div class="panel-copy">
-              <p class="eyebrow">SESSION NOTES</p>
-              <h2>Notes</h2>
-            </div>
-            <div class="panel-head-meta">
-              <div class="model-pill" id="notes-profile-label">Profile</div>
-              <button class="panel-close-button" data-panel-close="notes" type="button" aria-label="Close notes">
-                Close
-              </button>
-            </div>
-          </div>
-          <div class="notes-body">
-            <div class="notepad-sheet">
-              <label class="field-label" for="system-prompt-input">System prompt</label>
-              <p class="notepad-caption">
-                Optional per-profile prompt for inference only. It shapes replies, but it is not sent into RL feedback or training.
-              </p>
-              <textarea
-                id="system-prompt-input"
-                rows="6"
-                placeholder="Example: You are concise, direct, and helpful. Prefer short paragraphs, avoid roleplay, and do not act overly submissive."
-              ></textarea>
-              <label class="field-label" for="guidance-input">Steering notes</label>
-              <p class="notepad-caption">
-                Keep compact steering notes for the active profile without leaving the main chat flow.
-              </p>
-              <textarea
-                id="guidance-input"
-                rows="10"
-                placeholder="Example: If I ask for a refactor, preserve behavior first. If a fictional scenario is underspecified, ask one sharp clarifying question instead of guessing."
-              ></textarea>
-              <div class="notepad-actions">
-                <p class="save-status" id="guidance-status">Saved profile notes apply to future prompts.</p>
-                <button class="primary-button" id="guidance-save-button" type="button">Save notes</button>
-              </div>
-            </div>
-          </div>
-        </aside>
-
-        <aside class="utility-panel hidden" data-panel="settings" aria-hidden="true">
-          <div class="panel-head">
-            <div class="panel-copy">
-              <p class="eyebrow">TRAINING PROFILES</p>
-              <h2>Profiles</h2>
-            </div>
-            <div class="panel-head-meta">
-              <div class="model-pill" id="settings-active-profile">Profile</div>
-              <button class="panel-close-button" data-panel-close="settings" type="button" aria-label="Close profiles">
-                Close
-              </button>
-            </div>
-          </div>
-
-          <div class="settings-body">
-            <section class="settings-sidebar">
-              <p class="settings-kicker">Create profile</p>
-              <label class="field-label" for="profile-name-input">New profile name</label>
-              <input id="profile-name-input" type="text" placeholder="anime-girl / coding / roleplay" />
-              <button class="primary-button full-width-button" id="profile-create-button" type="button">
-                Create and switch
-              </button>
-              <p class="profile-create-status" id="profile-create-status">
-                Each profile keeps its own chats, notes, system prompt, and training state.
-              </p>
-            </section>
-
-            <section class="settings-main">
-              <div class="settings-head">
+          <section class="app-view calendar-app-view hidden" data-app-view="calendar" aria-hidden="true">
+            <div class="calendar-shell">
+              <div class="app-view-head">
                 <div>
-                  <p class="settings-kicker">Saved profiles</p>
-                  <h2>Switch training tracks</h2>
+                  <p class="eyebrow">OPENCLAW OS APP</p>
+                  <h2>Calendar</h2>
+                </div>
+                <div class="calendar-toolbar">
+                  <button class="calendar-nav-button" id="calendar-prev-month" type="button" aria-label="Previous month">
+                    ←
+                  </button>
+                  <div class="calendar-month-pill" id="calendar-month-label">Month</div>
+                  <button class="calendar-nav-button" id="calendar-next-month" type="button" aria-label="Next month">
+                    →
+                  </button>
                 </div>
               </div>
-              <div class="profiles-list" id="profiles-list"></div>
-              <div class="profiles-empty hidden" id="profiles-empty">
-                No profiles found yet. Create one to start a separate training track.
+
+              <div class="calendar-layout">
+                <section class="calendar-grid-card">
+                  <div class="calendar-weekdays">
+                    <span>Sun</span>
+                    <span>Mon</span>
+                    <span>Tue</span>
+                    <span>Wed</span>
+                    <span>Thu</span>
+                    <span>Fri</span>
+                    <span>Sat</span>
+                  </div>
+                  <div class="calendar-grid" id="calendar-grid"></div>
+                </section>
+
+                <aside class="calendar-day-card">
+                  <div class="calendar-day-head">
+                    <div>
+                      <p class="eyebrow">SELECTED DAY</p>
+                      <h3 id="calendar-selected-label">Today</h3>
+                    </div>
+                    <div class="model-pill" id="calendar-selected-meta">0 events</div>
+                  </div>
+
+                  <div class="calendar-day-events" id="calendar-day-events"></div>
+
+                  <div class="calendar-form">
+                    <label class="field-label" for="calendar-event-title">Event title</label>
+                    <input id="calendar-event-title" type="text" placeholder="Sprint review / grocery run / call mom" />
+                    <label class="field-label" for="calendar-event-note">Notes</label>
+                    <textarea
+                      id="calendar-event-note"
+                      rows="5"
+                      placeholder="Add context, reminders, or whatever you want to remember for this day."
+                    ></textarea>
+                    <div class="calendar-form-actions">
+                      <button class="primary-button" id="calendar-save-button" type="button">Save event</button>
+                      <button class="secondary-button" id="calendar-clear-button" type="button">Clear day</button>
+                    </div>
+                  </div>
+                </aside>
               </div>
-            </section>
-          </div>
-        </aside>
-      </main>
+            </div>
+          </section>
+
+          <section class="app-view utility-app-view hidden" data-app-view="notes" aria-hidden="true">
+            <div class="utility-app-shell">
+              <div class="app-view-head">
+                <div>
+                  <p class="eyebrow">PROFILE MEMORY</p>
+                  <h2>Notes</h2>
+                </div>
+                <div class="model-pill" id="notes-profile-label">Profile</div>
+              </div>
+              <div class="notes-body">
+                <div class="notepad-sheet">
+                  <label class="field-label" for="system-prompt-input">System prompt</label>
+                  <p class="notepad-caption">
+                    Optional per-profile prompt for inference only. It shapes replies, but it is not sent into RL
+                    feedback or training.
+                  </p>
+                  <textarea
+                    id="system-prompt-input"
+                    rows="6"
+                    placeholder="Example: You are concise, direct, and helpful. Prefer short paragraphs, avoid roleplay, and do not act overly submissive."
+                  ></textarea>
+                  <label class="field-label" for="guidance-input">Steering notes</label>
+                  <p class="notepad-caption">
+                    Keep compact steering notes for the active profile without leaving the workspace.
+                  </p>
+                  <textarea
+                    id="guidance-input"
+                    rows="10"
+                    placeholder="Example: If I ask for a refactor, preserve behavior first. If a fictional scenario is underspecified, ask one sharp clarifying question instead of guessing."
+                  ></textarea>
+                  <div class="notepad-actions">
+                    <p class="save-status" id="guidance-status">Saved profile notes apply to future prompts.</p>
+                    <button class="primary-button" id="guidance-save-button" type="button">Save notes</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="app-view utility-app-view hidden" data-app-view="profiles" aria-hidden="true">
+            <div class="utility-app-shell">
+              <div class="app-view-head">
+                <div>
+                  <p class="eyebrow">TRAINING PROFILES</p>
+                  <h2>Profiles</h2>
+                </div>
+                <div class="model-pill" id="settings-active-profile">Profile</div>
+              </div>
+
+              <div class="settings-body">
+                <section class="settings-sidebar">
+                  <p class="settings-kicker">Create profile</p>
+                  <label class="field-label" for="profile-name-input">New profile name</label>
+                  <input id="profile-name-input" type="text" placeholder="anime-girl / coding / roleplay" />
+                  <button class="primary-button full-width-button" id="profile-create-button" type="button">
+                    Create and switch
+                  </button>
+                  <p class="profile-create-status" id="profile-create-status">
+                    Each profile keeps its own chats, notes, system prompt, and training state.
+                  </p>
+                </section>
+
+                <section class="settings-main">
+                  <div class="settings-head">
+                    <div>
+                      <p class="settings-kicker">Saved profiles</p>
+                      <h2>Switch training tracks</h2>
+                    </div>
+                  </div>
+                  <div class="profiles-list" id="profiles-list"></div>
+                  <div class="profiles-empty hidden" id="profiles-empty">
+                    No profiles found yet. Create one to start a separate training track.
+                  </div>
+                </section>
+              </div>
+            </div>
+          </section>
+        </main>
+      </div>
     </div>
 
     <template id="message-template">
@@ -187,6 +282,6 @@
       </article>
     </template>
 
-    <script src="/static/app.js?v=20260326f"></script>
+    <script src="/static/app.js?v=20260326g"></script>
   </body>
 </html>
