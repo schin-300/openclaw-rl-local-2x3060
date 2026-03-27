@@ -68,17 +68,19 @@ HERETIC_HEALTH_PATH = os.environ.get("OPENCLAW_HERETIC_HEALTH_PATH", "/health")
 HERETIC_CHAT_URL = f"{HERETIC_PROXY_BASE_URL}{HERETIC_CHAT_PATH}"
 HERETIC_HEALTH_URL = f"{HERETIC_PROXY_BASE_URL}{HERETIC_HEALTH_PATH}"
 HERETIC_MODEL_NAME = os.environ.get("OPENCLAW_HERETIC_MODEL", "27B sidecar model")
+HERETIC_SERVED_MODEL_NAME = os.environ.get("OPENCLAW_HERETIC_SERVED_MODEL", HERETIC_MODEL_NAME)
 HERETIC_API_KEY = os.environ.get("OPENCLAW_HERETIC_API_KEY", API_KEY)
 HERETIC_SERVICE_NAME = os.environ.get("OPENCLAW_HERETIC_SERVICE_NAME", "openclaw-27b-sidecar.service").strip()
 HERETIC_UI_MAX_TOKENS = int(os.environ.get("OPENCLAW_HERETIC_UI_MAX_TOKENS", "128"))
-HERETIC_PLAIN_ANSWER_SYSTEM_PROMPT = (
-    "You are in plain-answer mode for a simple local chat app. Reply only with the user-facing answer text. "
-    "Do not emit <think>, </think>, hidden reasoning, analysis, or chain-of-thought."
-)
-HERETIC_RETRY_SYSTEM_PROMPT = (
-    "Retry in strict plain-answer mode. Do not repeat the user's instruction. "
-    "Do not explain your reasoning. Output only the final answer text."
-)
+HERETIC_TEMPERATURE = float(os.environ.get("OPENCLAW_HERETIC_TEMPERATURE", "0.6"))
+HERETIC_TOP_P = float(os.environ.get("OPENCLAW_HERETIC_TOP_P", "0.95"))
+HERETIC_TOP_K = int(os.environ.get("OPENCLAW_HERETIC_TOP_K", "20"))
+HERETIC_PRESENCE_PENALTY = float(os.environ.get("OPENCLAW_HERETIC_PRESENCE_PENALTY", "0.0"))
+HERETIC_PLAIN_ANSWER_SYSTEM_PROMPT = os.environ.get("OPENCLAW_HERETIC_SYSTEM_PROMPT", "").strip()
+HERETIC_RETRY_SYSTEM_PROMPT = os.environ.get(
+    "OPENCLAW_HERETIC_RETRY_SYSTEM_PROMPT",
+    "Reply directly to the user with only the final answer text.",
+).strip()
 DEFAULT_PROFILE_ID = os.environ.get("OPENCLAW_RL_DEFAULT_PROFILE_ID", "default").strip() or "default"
 REQUEST_TIMEOUT = float(os.environ.get("OPENCLAW_RL_UI_TIMEOUT_SECONDS", "600"))
 MAX_HISTORY_TURNS = int(os.environ.get("OPENCLAW_RL_UI_MAX_HISTORY_TURNS", "16"))
@@ -843,6 +845,55 @@ def _strip_heretic_think_markup(text: str) -> str:
     return cleaned.strip()
 
 
+def _extract_heretic_stream_visible_text(text: str, *, final: bool) -> str:
+    raw_text = str(text or "")
+    if not raw_text:
+        return ""
+
+    visible_chunks: list[str] = []
+    depth = 0
+    index = 0
+    while index < len(raw_text):
+        lower_slice = raw_text[index:].lower()
+        if lower_slice.startswith("<think>"):
+            depth += 1
+            index += len("<think>")
+            continue
+        if lower_slice.startswith("</think>"):
+            if depth > 0:
+                depth -= 1
+            index += len("</think>")
+            continue
+        if depth == 0:
+            visible_chunks.append(raw_text[index])
+        index += 1
+
+    visible = "".join(visible_chunks)
+    if not final:
+        visible = visible.lstrip()
+    visible = re.sub(r"\n{3,}", "\n\n", visible)
+    return visible
+
+
+def _resolve_heretic_stream_visible_text(text: str, *, prompt: str) -> str:
+    candidate = _extract_heretic_stream_visible_text(text, final=False).strip("\"' \n\t")
+    if not candidate:
+        return ""
+
+    extracted_tail = _extract_heretic_final_line(candidate, prompt=prompt)
+    if extracted_tail:
+        return extracted_tail
+
+    if candidate.lower().startswith("thinking process:"):
+        extracted_answer = _extract_final_answer(candidate)
+        return extracted_answer.strip("\"' \n\t") if extracted_answer else ""
+
+    if _looks_like_heretic_meta_response(candidate, prompt=prompt):
+        return ""
+
+    return candidate
+
+
 def _normalize_compact_text(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip()
 
@@ -1180,7 +1231,11 @@ async def _proxy_openai_chat_once(
         "model": model_name,
         "messages": _normalize_openai_chat_messages(messages),
         "stream": False,
-        "enable_thinking": False,
+        "temperature": HERETIC_TEMPERATURE,
+        "top_p": HERETIC_TOP_P,
+        "top_k": HERETIC_TOP_K,
+        "presence_penalty": HERETIC_PRESENCE_PENALTY,
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     if max_tokens is not None:
         body["max_tokens"] = max_tokens
@@ -1236,7 +1291,11 @@ async def _proxy_openai_chat_stream(
         "model": model_name,
         "messages": _normalize_openai_chat_messages(messages),
         "stream": True,
-        "enable_thinking": False,
+        "temperature": HERETIC_TEMPERATURE,
+        "top_p": HERETIC_TOP_P,
+        "top_k": HERETIC_TOP_K,
+        "presence_penalty": HERETIC_PRESENCE_PENALTY,
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     if max_tokens is not None:
         body["max_tokens"] = max_tokens
@@ -1278,7 +1337,7 @@ async def _proxy_openai_chat_stream(
                     choice = choices[0]
                     delta = choice.get("delta") or {}
                     content = str(delta.get("content") or "")
-                    reasoning_content = str(delta.get("reasoning_content") or "")
+                    reasoning_content = str(delta.get("reasoning_content") or delta.get("reasoning") or "")
                     metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
                     if content or reasoning_content or metrics:
                         yield {
@@ -1477,7 +1536,7 @@ async def _proxy_chat_stream(
                         choice = choices[0]
                         delta = choice.get("delta") or {}
                         content = delta.get("content") or ""
-                        reasoning_content = delta.get("reasoning_content") or ""
+                        reasoning_content = delta.get("reasoning_content") or delta.get("reasoning") or ""
                         metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
                         if content or reasoning_content or metrics:
                             yield {
@@ -2407,7 +2466,9 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
                     assistant_reasoning = assistant_reasoning.strip()
                     assistant_text = assistant_text.strip()
                 else:
-                    assistant_reasoning = str(assistant_message.get("reasoning_content") or "").strip()
+                    assistant_reasoning = str(
+                        assistant_message.get("reasoning_content") or assistant_message.get("reasoning") or ""
+                    ).strip()
                     assistant_text = _resolve_assistant_text(raw_assistant_content, assistant_reasoning)
 
                 delta = assistant_text[len(final_text) :] if assistant_text.startswith(final_text) else assistant_text
@@ -2587,13 +2648,13 @@ async def api_heretic_chat_stream(request: Request, body: ChatRequest) -> Stream
         "metrics": None,
     }
     prompt_messages = [
-        {"role": "system", "content": HERETIC_PLAIN_ANSWER_SYSTEM_PROMPT},
+        *([{"role": "system", "content": HERETIC_PLAIN_ANSWER_SYSTEM_PROMPT}] if HERETIC_PLAIN_ANSWER_SYSTEM_PROMPT else []),
         *transcript_messages,
         {"role": "user", "content": prompt},
     ]
     retry_prompt_messages = [
-        {"role": "system", "content": HERETIC_PLAIN_ANSWER_SYSTEM_PROMPT},
-        {"role": "system", "content": HERETIC_RETRY_SYSTEM_PROMPT},
+        *([{"role": "system", "content": HERETIC_PLAIN_ANSWER_SYSTEM_PROMPT}] if HERETIC_PLAIN_ANSWER_SYSTEM_PROMPT else []),
+        *([{"role": "system", "content": HERETIC_RETRY_SYSTEM_PROMPT}] if HERETIC_RETRY_SYSTEM_PROMPT else []),
         *transcript_messages,
         {"role": "user", "content": prompt},
     ]
@@ -2601,8 +2662,9 @@ async def api_heretic_chat_stream(request: Request, body: ChatRequest) -> Stream
     async def event_stream():
         committed = False
         stop_requested = False
-        final_text = ""
-        final_reasoning = ""
+        streamed_raw_text = ""
+        streamed_raw_reasoning = ""
+        streamed_visible_text = ""
         last_metrics: dict[str, Any] | None = None
         finish_reason = "stop"
         stream_started_at = time.perf_counter()
@@ -2620,7 +2682,7 @@ async def api_heretic_chat_stream(request: Request, body: ChatRequest) -> Stream
             async for event in _proxy_openai_chat_stream(
                 url=HERETIC_CHAT_URL,
                 api_key=HERETIC_API_KEY,
-                model_name=HERETIC_MODEL_NAME,
+                model_name=HERETIC_SERVED_MODEL_NAME,
                 messages=prompt_messages,
                 max_tokens=HERETIC_UI_MAX_TOKENS,
                 service_name=HERETIC_SERVICE_NAME,
@@ -2643,15 +2705,31 @@ async def api_heretic_chat_stream(request: Request, body: ChatRequest) -> Stream
                     if first_token_at is None and (delta or reasoning_delta or raw_metrics):
                         first_token_at = time.perf_counter()
                     if delta:
-                        final_text += delta
+                        streamed_raw_text += delta
                     if reasoning_delta:
-                        final_reasoning += reasoning_delta
+                        streamed_raw_reasoning += reasoning_delta
+                    next_visible_text = _resolve_heretic_stream_visible_text(streamed_raw_text, prompt=prompt)
+                    visible_delta = (
+                        next_visible_text[len(streamed_visible_text) :]
+                        if next_visible_text.startswith(streamed_visible_text)
+                        else next_visible_text
+                    )
+                    streamed_visible_text = next_visible_text
                     last_metrics = _stream_metrics_fallback(
                         raw_metrics,
-                        visible_text="",
-                        reasoning_text=final_reasoning,
+                        visible_text=streamed_visible_text,
+                        reasoning_text="",
                         started_at=stream_started_at,
                         first_token_at=first_token_at,
+                    )
+                    yield _sse_event(
+                        "delta",
+                        {
+                            "assistant_turn_id": assistant_turn["id"],
+                            "delta": visible_delta,
+                            "reasoning_delta": "",
+                            "metrics": last_metrics,
+                        },
                     )
                     continue
 
@@ -2659,18 +2737,22 @@ async def api_heretic_chat_stream(request: Request, body: ChatRequest) -> Stream
                     finish_reason = str(event.get("finish_reason") or "stop")
                     last_metrics = _stream_metrics_fallback(
                         event.get("metrics") or last_metrics,
-                        visible_text=final_text,
-                        reasoning_text=final_reasoning,
+                        visible_text=streamed_visible_text,
+                        reasoning_text="",
                         started_at=stream_started_at,
                         first_token_at=first_token_at,
                     )
 
             stop_requested = stop_requested or _is_heretic_stream_stop_requested(browser_id)
             assistant_reasoning = ""
-            assistant_text = _resolve_heretic_assistant_text(final_text, final_reasoning, prompt=prompt)
+            assistant_text = _resolve_heretic_assistant_text(
+                streamed_raw_text,
+                streamed_raw_reasoning,
+                prompt=prompt,
+            )
             needs_retry = not stop_requested and _heretic_response_needs_retry(
-                final_text,
-                final_reasoning,
+                streamed_raw_text,
+                streamed_raw_reasoning,
                 assistant_text,
                 prompt=prompt,
             )
@@ -2680,7 +2762,7 @@ async def api_heretic_chat_stream(request: Request, body: ChatRequest) -> Stream
                     fallback_response = await _proxy_openai_chat_once(
                         url=HERETIC_CHAT_URL,
                         api_key=HERETIC_API_KEY,
-                        model_name=HERETIC_MODEL_NAME,
+                        model_name=HERETIC_SERVED_MODEL_NAME,
                         messages=retry_prompt_messages,
                         max_tokens=min(HERETIC_UI_MAX_TOKENS, 32),
                         service_name=HERETIC_SERVICE_NAME,
@@ -2688,7 +2770,9 @@ async def api_heretic_chat_stream(request: Request, body: ChatRequest) -> Stream
                     )
                     choice = (fallback_response.get("choices") or [{}])[0]
                     assistant_message = choice.get("message") or {}
-                    fallback_reasoning = str(assistant_message.get("reasoning_content") or "")
+                    fallback_reasoning = str(
+                        assistant_message.get("reasoning_content") or assistant_message.get("reasoning") or ""
+                    )
                     fallback_content = str(assistant_message.get("content") or "")
                     assistant_text = _resolve_heretic_assistant_text(
                         fallback_content,
@@ -2723,6 +2807,23 @@ async def api_heretic_chat_stream(request: Request, body: ChatRequest) -> Stream
 
             if not assistant_text and not assistant_reasoning:
                 raise HTTPException(status_code=502, detail="27B model returned malformed think-tag output")
+
+            trailing_delta = (
+                assistant_text[len(streamed_visible_text) :]
+                if assistant_text.startswith(streamed_visible_text)
+                else assistant_text
+            )
+            if trailing_delta:
+                streamed_visible_text = assistant_text
+                yield _sse_event(
+                    "delta",
+                    {
+                        "assistant_turn_id": assistant_turn["id"],
+                        "delta": trailing_delta,
+                        "reasoning_delta": "",
+                        "metrics": last_metrics or {},
+                    },
+                )
 
             last_metrics = _stream_metrics_fallback(
                 last_metrics,
@@ -2897,7 +2998,9 @@ async def api_chat(request: Request, body: ChatRequest) -> JSONResponse:
             assistant_reasoning = assistant_reasoning.strip()
             assistant_text = assistant_text.strip()
         else:
-            assistant_reasoning = (assistant_message.get("reasoning_content") or "").strip()
+            assistant_reasoning = (
+                assistant_message.get("reasoning_content") or assistant_message.get("reasoning") or ""
+            ).strip()
             assistant_text = _resolve_assistant_text(raw_assistant_content, assistant_reasoning)
         if not assistant_text and not assistant_reasoning:
             raise HTTPException(status_code=502, detail="Model returned an empty response")

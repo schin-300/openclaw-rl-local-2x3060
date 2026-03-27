@@ -210,6 +210,11 @@ button:disabled {
   min-height: 0;
 }
 
+.app-view:focus-visible {
+  outline: 1px solid rgba(45, 127, 249, 0.34);
+  outline-offset: -1px;
+}
+
 .app-view-head {
   display: flex;
   align-items: flex-start;
@@ -862,6 +867,59 @@ textarea:focus {
 .utility-app-view,
 .calendar-app-view {
   overflow-y: auto;
+}
+
+.session-list,
+.transcript,
+.utility-app-view,
+.calendar-app-view,
+.profiles-list,
+.calendar-day-events {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(117, 160, 255, 0.56) rgba(255, 255, 255, 0.05);
+  scrollbar-gutter: stable both-edges;
+  overscroll-behavior-y: contain;
+}
+
+.session-list::-webkit-scrollbar,
+.transcript::-webkit-scrollbar,
+.utility-app-view::-webkit-scrollbar,
+.calendar-app-view::-webkit-scrollbar,
+.profiles-list::-webkit-scrollbar,
+.calendar-day-events::-webkit-scrollbar {
+  width: 10px;
+}
+
+.session-list::-webkit-scrollbar-track,
+.transcript::-webkit-scrollbar-track,
+.utility-app-view::-webkit-scrollbar-track,
+.calendar-app-view::-webkit-scrollbar-track,
+.profiles-list::-webkit-scrollbar-track,
+.calendar-day-events::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 999px;
+}
+
+.session-list::-webkit-scrollbar-thumb,
+.transcript::-webkit-scrollbar-thumb,
+.utility-app-view::-webkit-scrollbar-thumb,
+.calendar-app-view::-webkit-scrollbar-thumb,
+.profiles-list::-webkit-scrollbar-thumb,
+.calendar-day-events::-webkit-scrollbar-thumb {
+  background: rgba(117, 160, 255, 0.5);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+.session-list::-webkit-scrollbar-thumb:hover,
+.transcript::-webkit-scrollbar-thumb:hover,
+.utility-app-view::-webkit-scrollbar-thumb:hover,
+.calendar-app-view::-webkit-scrollbar-thumb:hover,
+.profiles-list::-webkit-scrollbar-thumb:hover,
+.calendar-day-events::-webkit-scrollbar-thumb:hover {
+  background: rgba(157, 189, 255, 0.72);
+  background-clip: padding-box;
 }
 
 .utility-app-shell,

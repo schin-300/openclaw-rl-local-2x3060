@@ -1,12 +1,12 @@
 ## 27B Chat + Model Control Spec
 
 Date: 2026-03-26
-Status: Working prototype on the live site. Functional sidecar lane runs through
-`llama.cpp` with a clean no-think template override, prompt cache disabled, an app-side
-plain-answer wrapper, and a capped `128`-token UI reply budget. That combination is the
-current production-safe path for this hardware. The sidecar app and model-control app are
-working, but the `>20 tok/s` acceptance target is still an open performance requirement,
-not a completed one.
+Status: Working prototype on the live site. The functional sidecar lane now runs through
+`vLLM` with `groxaxo/Qwen3.5-27B-heretic-v3-autoround-w4a16` at `32768` context. The
+critical no-think fix was aligning the mounted chat template with the model's official
+Qwen3.5 template so disabled-thinking requests emit normal assistant `content` instead of
+reasoning-only output. The sidecar app and model-control app are working, but the
+`>20 tok/s` acceptance target is still open.
 
 ### Goal
 
@@ -46,15 +46,17 @@ file:
   - model file: `Qwen3.5-27B-heretic-v3-Q4_K_M.gguf`
   - model repo: `llmfan46/Qwen3.5-27B-heretic-v3-GGUF`
 - Current best working runtime on this box:
-  - backend: `llama.cpp`
-  - model repo: `mradermacher/Qwen3.5-27B-heretic-v3-i1-GGUF`
-  - model file: `Qwen3.5-27B-heretic-v3.i1-IQ2_XS.gguf`
+  - backend: `vLLM`
+  - model repo: `groxaxo/Qwen3.5-27B-heretic-v3-autoround-w4a16`
+  - quantization: `auto-round` / `W4A16`
   - context: `32768`
-  - measured decode speed: about `14` to `16 tok/s` depending prompt shape
-- If the preferred target cannot satisfy the performance bar under `SGLang`,
+  - production topology: tensor parallel `2`, pipeline parallel `1`
+  - no-think requests require the model's official empty `<think></think>` assistant prefill
+  - steady-state browser-visible speed currently lands around `8` to `12 tok/s`
+- If the current `vLLM` runtime fails the quality, stability, or startup bar,
   fallback runtimes may be used:
   - `llama.cpp`
-  - `vLLM`
+  - `vLLM` with a different Heretic-family quant
 - The control surface must always show the real active model identifier and
   backend instead of pretending the sidecar lane is something else.
 - Sidecar lane target config:
@@ -156,24 +158,41 @@ Tested on this machine with `32768` context:
 - `cyankiwi/Qwen3.5-27B-AWQ-4bit`
   - `vLLM`
   - failed to complete `32768` startup on this box
+- `groxaxo/Qwen3.5-27B-heretic-v3-autoround-w4a16`
+  - `vLLM`
+  - direct API with mismatched custom template produced reasoning-only output and severe lag
+  - after switching the mounted template to the model's official empty-think prefill,
+    disabled-thinking requests emitted normal assistant `content`
+  - cold first request after restart paid a one-time compile tax of about `78.6s` to first
+    token because startup warmup is intentionally skipped by the local patch
+  - immediate steady-state retest dropped to about `0.258s` first token and about `9.739s`
+    total for a four-sentence moon prompt
+- `groxaxo/Qwen3.5-27B-heretic-v3-autoround-w4a16`
+  - `vLLM` with `pipeline_parallel_size=2`
+  - failed startup on this box at `32768` context with a compile-time CUDA OOM on GPU 1
 
 Current conclusion:
 
 - `SGLang` does not currently support the exact Heretic GGUF on this machine.
 - `vLLM` did not boot the tested `27B AWQ` fallback at `32768`.
-- `llama.cpp` is the working path.
+- `vLLM` is now the current working path for the live 27B lane.
+- The essential parser fix was template correctness, not extra UI post-processing:
+  when thinking is disabled, Qwen3.5 expects an empty `<think></think>` assistant prefill.
+- `pipeline_parallel_size=2` is not currently viable on this `2x3060` box at `32768`
+  because it OOMs during startup compilation, so the stable live config remains tensor
+  parallel `2`.
 - The current stable production setting is:
-  - model: `mradermacher/Qwen3.5-27B-heretic-v3-i1-GGUF:Qwen3.5-27B-heretic-v3.i1-IQ2_XS.gguf`
+  - model: `groxaxo/Qwen3.5-27B-heretic-v3-autoround-w4a16`
+  - backend: `vLLM`
   - context: `32768`
-  - reasoning disabled at runtime
-  - custom chat template that does not inject `<think>` in plain-answer mode
-  - app-side sanitation + retry wrapper for malformed think-tag outputs
-  - UI reply cap: `128`
-  - measured raw decode: about `14` to `16 tok/s`
-  - verified live browser UI result: about `18.7 tok/s` on the exact `Reply with exactly: hello.` check
-- Larger reply budgets can still trigger malformed `</think>` output on this model/runtime
-  pair, so they are out of scope for the first working prototype.
-- The sidecar lane is therefore functionally complete for v1 app behavior, but not yet signed
+  - topology: tensor parallel `2`
+  - reasoning parser: `qwen3`
+  - mounted template aligned to the model's official no-think assistant prefill
+  - UI sampling follows the model's generation defaults: `temperature 0.6`, `top_p 0.95`,
+    `top_k 20`, `presence_penalty 0.0`
+  - cold first request after restart is still slow because the local patch skips the heavy
+    startup warmup and pushes that compile cost onto the first real prompt
+- The sidecar lane is functionally complete for v1 app behavior, but it is still not signed
   off against the `>20 tok/s` performance target.
 
 ### Decision Rule

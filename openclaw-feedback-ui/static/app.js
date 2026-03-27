@@ -585,6 +585,7 @@ function renderShell() {
   const appMeta = getAppMeta();
   const chatActive = state.activeApp === "chat";
   const showProfilePill = ["chat", "notes", "profiles"].includes(state.activeApp);
+  const keyboardScrollApps = new Set(["calendar", "notes", "profiles", "model-control"]);
 
   if (els.windowModelEyebrow) {
     els.windowModelEyebrow.textContent = appMeta.eyebrow;
@@ -612,7 +613,21 @@ function renderShell() {
     const isActive = view.dataset.appView === state.activeApp;
     view.classList.toggle("hidden", !isActive);
     view.setAttribute("aria-hidden", isActive ? "false" : "true");
+    view.tabIndex = isActive && keyboardScrollApps.has(state.activeApp) ? 0 : -1;
   }
+}
+
+function focusActiveAppView() {
+  if (["chat", "heretic"].includes(state.activeApp)) {
+    return;
+  }
+  const activeView = els.appViews.find((view) => view.dataset.appView === state.activeApp);
+  if (!activeView) {
+    return;
+  }
+  window.requestAnimationFrame(() => {
+    activeView.focus({ preventScroll: true });
+  });
 }
 
 function activateApp(appId) {
@@ -633,6 +648,7 @@ function activateApp(appId) {
   if (appId === "model-control") {
     renderModelControl();
   }
+  focusActiveAppView();
 }
 
 function getCalendarEventsForDay(dateKey) {
@@ -2113,6 +2129,7 @@ setProfileCreateStatus("Create a new saved training profile.");
 autoResizeComposer();
 autoResizeHereticComposer();
 renderShell();
+focusActiveAppView();
 renderCalendar();
 renderHereticTranscript();
 renderModelControl();
