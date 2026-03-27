@@ -62,6 +62,23 @@ API_KEY = os.environ.get("OPENCLAW_RL_API_KEY", "openclaw-local")
 CHAT_API_KEY = os.environ.get("OPENCLAW_RL_CHAT_API_KEY", API_KEY)
 TRAINING_API_KEY = os.environ.get("OPENCLAW_RL_TRAINING_API_KEY", API_KEY)
 MODEL_NAME = os.environ.get("OPENCLAW_RL_MODEL", "qwen3-0.6b-local")
+HERETIC_PROXY_BASE_URL = os.environ.get("OPENCLAW_HERETIC_PROXY_BASE_URL", "http://127.0.0.1:30121").rstrip("/")
+HERETIC_CHAT_PATH = os.environ.get("OPENCLAW_HERETIC_CHAT_PATH", "/v1/chat/completions")
+HERETIC_HEALTH_PATH = os.environ.get("OPENCLAW_HERETIC_HEALTH_PATH", "/health")
+HERETIC_CHAT_URL = f"{HERETIC_PROXY_BASE_URL}{HERETIC_CHAT_PATH}"
+HERETIC_HEALTH_URL = f"{HERETIC_PROXY_BASE_URL}{HERETIC_HEALTH_PATH}"
+HERETIC_MODEL_NAME = os.environ.get("OPENCLAW_HERETIC_MODEL", "27B sidecar model")
+HERETIC_API_KEY = os.environ.get("OPENCLAW_HERETIC_API_KEY", API_KEY)
+HERETIC_SERVICE_NAME = os.environ.get("OPENCLAW_HERETIC_SERVICE_NAME", "openclaw-27b-sidecar.service").strip()
+HERETIC_UI_MAX_TOKENS = int(os.environ.get("OPENCLAW_HERETIC_UI_MAX_TOKENS", "128"))
+HERETIC_PLAIN_ANSWER_SYSTEM_PROMPT = (
+    "You are in plain-answer mode for a simple local chat app. Reply only with the user-facing answer text. "
+    "Do not emit <think>, </think>, hidden reasoning, analysis, or chain-of-thought."
+)
+HERETIC_RETRY_SYSTEM_PROMPT = (
+    "Retry in strict plain-answer mode. Do not repeat the user's instruction. "
+    "Do not explain your reasoning. Output only the final answer text."
+)
 DEFAULT_PROFILE_ID = os.environ.get("OPENCLAW_RL_DEFAULT_PROFILE_ID", "default").strip() or "default"
 REQUEST_TIMEOUT = float(os.environ.get("OPENCLAW_RL_UI_TIMEOUT_SECONDS", "600"))
 MAX_HISTORY_TURNS = int(os.environ.get("OPENCLAW_RL_UI_MAX_HISTORY_TURNS", "16"))
@@ -87,6 +104,12 @@ USE_NATIVE_CHAT_THINKING = os.environ.get("OPENCLAW_RL_USE_NATIVE_CHAT_THINKING"
     "yes",
     "on",
 }
+MODEL_SWITCH_WAIT_SECONDS = int(os.environ.get("OPENCLAW_MODEL_SWITCH_WAIT_SECONDS", "2400"))
+GPU_MODE_OPENCLAW = "openclaw_rl"
+GPU_MODE_HERETIC = "heretic_chat"
+GPU_MODE_MIXED = "mixed"
+GPU_MODE_IDLE = "idle"
+GPU_MODE_TRANSITIONING = "transitioning"
 PROFILES_SUPPORTED = TRAINING_BACKEND_MODE == "trainer_api"
 PROFILES_URL = f"{PROFILE_PROXY_BASE_URL}/v1/profiles"
 PROFILE_CREATE_URL = f"{PROFILE_PROXY_BASE_URL}/v1/profiles"
@@ -152,6 +175,10 @@ class SessionSelectRequest(BaseModel):
 
 class ThinkingRequest(BaseModel):
     enabled: bool = False
+
+
+class ModelControlSwitchRequest(BaseModel):
+    mode: str = ""
 
 
 def _profile_dir(profile_id: str) -> Path:
@@ -471,12 +498,15 @@ def _load_state_from_session(state: dict[str, Any], profile_id: str, session_id:
 def _new_browser_state(profile_id: str | None = None) -> dict[str, Any]:
     state = {
         "transcript": [],
+        "heretic_transcript": [],
         "context_messages": [],
         "feedback_candidates": {},
         "sessions": [],
         "active_session_id": "",
         "busy": False,
+        "heretic_busy": False,
         "stream_stop_requested": False,
+        "heretic_stream_stop_requested": False,
         "guidance_text": "",
         "system_prompt_text": "",
         "thinking_enabled": False,
@@ -494,10 +524,14 @@ def _serialize_state(state: dict[str, Any]) -> dict[str, Any]:
     )
     return {
         "transcript": state["transcript"],
+        "heretic_transcript": state.get("heretic_transcript", []),
         "awaiting_feedback": awaiting_feedback,
         "busy": state["busy"],
+        "heretic_busy": bool(state.get("heretic_busy")),
         "stop_requested": bool(state.get("stream_stop_requested")),
+        "heretic_stop_requested": bool(state.get("heretic_stream_stop_requested")),
         "model": MODEL_NAME,
+        "heretic_model": HERETIC_MODEL_NAME,
         "backend_mode": BACKEND_MODE,
         "chat_backend_mode": CHAT_BACKEND_MODE,
         "training_backend_mode": TRAINING_BACKEND_MODE,
@@ -526,6 +560,17 @@ def _is_stream_stop_requested(browser_id: str) -> bool:
     with _state_lock:
         state = _browser_sessions.get(browser_id)
         return bool(state and state.get("stream_stop_requested"))
+
+
+def _is_heretic_stream_stop_requested(browser_id: str) -> bool:
+    with _state_lock:
+        state = _browser_sessions.get(browser_id)
+        return bool(state and state.get("heretic_stream_stop_requested"))
+
+
+def _has_any_busy_sessions() -> bool:
+    with _state_lock:
+        return any(bool(state.get("busy")) or bool(state.get("heretic_busy")) for state in _browser_sessions.values())
 
 
 def _persist_active_session_state(state: dict[str, Any], *, title_from_prompt: str | None = None) -> None:
@@ -603,6 +648,21 @@ def _trim_context(messages: list[dict[str, str]]) -> list[dict[str, str]]:
     if len(messages) <= MAX_HISTORY_TURNS * 2:
         return messages
     return messages[-MAX_HISTORY_TURNS * 2 :]
+
+
+def _trim_transcript_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    cleaned: list[dict[str, Any]] = []
+    for item in messages:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        if role not in {"user", "assistant", "system"}:
+            continue
+        content = str(item.get("content") or "").strip()
+        if not content:
+            continue
+        cleaned.append({"role": role, "content": content})
+    return _trim_context(cleaned)
 
 
 def _normalize_openai_chat_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -776,6 +836,123 @@ def _resolve_assistant_text(content: str, reasoning_text: str) -> str:
     return ""
 
 
+def _strip_heretic_think_markup(text: str) -> str:
+    cleaned = str(text or "")
+    cleaned = re.sub(r"</?think>\s*", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _normalize_compact_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def _looks_like_heretic_meta_response(text: str, *, prompt: str = "") -> bool:
+    normalized = _normalize_compact_text(text).lower()
+    prompt_normalized = _normalize_compact_text(prompt).lower()
+    if not normalized:
+        return False
+    if prompt_normalized and (normalized == prompt_normalized or normalized.startswith(prompt_normalized)):
+        return True
+    markers = (
+        "the user wants",
+        "i need to",
+        "i should",
+        "i must",
+        "just the word",
+        "do not include any extra",
+        "simple reply",
+        "final answer text",
+        "repeat the user's instruction",
+    )
+    return any(marker in normalized for marker in markers)
+
+
+def _extract_heretic_final_line(candidate: str, *, prompt: str = "") -> str:
+    lines = [
+        re.sub(r"^[>\-*+\s]+", "", line).strip("\"' \t")
+        for line in str(candidate or "").splitlines()
+        if str(line).strip()
+    ]
+    if len(lines) < 2:
+        return ""
+    tail = lines[-1]
+    prefix = " ".join(lines[:-1])
+    prompt_normalized = _normalize_compact_text(prompt).lower()
+    if not tail:
+        return ""
+    if prompt_normalized and _normalize_compact_text(tail).lower() == prompt_normalized:
+        return ""
+    if len(tail) <= 120 and _looks_like_heretic_meta_response(prefix, prompt=prompt):
+        return tail
+    return ""
+
+
+def _resolve_heretic_assistant_text(content: str, reasoning_text: str = "", *, prompt: str = "") -> str:
+    clean_content = _strip_heretic_think_markup(content)
+    clean_reasoning = _strip_heretic_think_markup(reasoning_text)
+    candidate = _resolve_assistant_text(clean_content, clean_reasoning) or clean_content
+    extracted_tail = _extract_heretic_final_line(candidate, prompt=prompt)
+    if extracted_tail:
+        candidate = extracted_tail
+    candidate = re.sub(r"^[\s:;\-.,]+", "", candidate).strip("\"' \n\t")
+    if not candidate:
+        return ""
+    if candidate.lower().startswith("thinking process:"):
+        extracted_answer = _extract_final_answer(candidate)
+        return extracted_answer.strip("\"' \n\t") if extracted_answer else ""
+    if re.fullmatch(r"(?:thinking process:)?\s*", candidate, flags=re.I | re.S):
+        return ""
+    prompt_normalized = _normalize_compact_text(prompt).lower()
+    if prompt_normalized and _normalize_compact_text(candidate).lower() == prompt_normalized:
+        return ""
+    return candidate
+
+
+def _heretic_response_needs_retry(raw_content: str, raw_reasoning: str, assistant_text: str, *, prompt: str) -> bool:
+    if not assistant_text:
+        return True
+    prompt_normalized = _normalize_compact_text(prompt).lower()
+    if prompt_normalized and _normalize_compact_text(assistant_text).lower() == prompt_normalized:
+        return True
+    raw_combined = "\n".join(
+        part
+        for part in (
+            _strip_heretic_think_markup(raw_reasoning),
+            _strip_heretic_think_markup(raw_content),
+        )
+        if part
+    ).strip()
+    return _looks_like_heretic_meta_response(raw_combined, prompt=prompt)
+
+
+def _heretic_metrics_from_payload(
+    payload: dict[str, Any],
+    *,
+    assistant_text: str,
+    started_at: float,
+    first_token_at: float | None,
+) -> dict[str, Any]:
+    timings = payload.get("timings") if isinstance(payload.get("timings"), dict) else {}
+    raw_metrics: dict[str, Any] = {}
+    predicted_n = timings.get("predicted_n")
+    if isinstance(predicted_n, (int, float)) and predicted_n >= 0:
+        raw_metrics["generated_tokens"] = int(round(float(predicted_n)))
+    predicted_ms = timings.get("predicted_ms")
+    if isinstance(predicted_ms, (int, float)) and predicted_ms > 0:
+        raw_metrics["elapsed_seconds"] = float(predicted_ms) / 1000.0
+    predicted_per_second = timings.get("predicted_per_second")
+    if isinstance(predicted_per_second, (int, float)) and predicted_per_second > 0:
+        raw_metrics["tokens_per_second"] = float(predicted_per_second)
+    return _stream_metrics_fallback(
+        raw_metrics,
+        visible_text=assistant_text,
+        reasoning_text="",
+        started_at=started_at,
+        first_token_at=first_token_at,
+    )
+
+
 _TOKEN_ESTIMATE_PATTERN = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 
 
@@ -797,12 +974,20 @@ def _stream_metrics_fallback(
     merged = dict(metrics) if isinstance(metrics, dict) else {}
 
     visible_tokens = merged.get("visible_tokens")
-    if not isinstance(visible_tokens, (int, float)) or visible_tokens < 0:
+    if (
+        not isinstance(visible_tokens, (int, float))
+        or visible_tokens < 0
+        or (visible_tokens == 0 and str(visible_text or "").strip())
+    ):
         visible_tokens = _estimate_token_count(visible_text)
     visible_tokens = max(int(round(float(visible_tokens))), 0)
 
     generated_tokens = merged.get("generated_tokens")
-    if not isinstance(generated_tokens, (int, float)) or generated_tokens < visible_tokens:
+    if (
+        not isinstance(generated_tokens, (int, float))
+        or generated_tokens < visible_tokens
+        or (generated_tokens == 0 and (str(visible_text or "").strip() or str(reasoning_text or "").strip()))
+    ):
         combined_text = "\n".join(part for part in (reasoning_text.strip(), visible_text.strip()) if part)
         generated_tokens = _estimate_token_count(combined_text) if combined_text else visible_tokens
     generated_tokens = max(int(round(float(generated_tokens))), visible_tokens)
@@ -975,6 +1160,151 @@ async def _aiter_sse_payloads(response: httpx.Response):
             data_lines.append(line[5:].lstrip())
     if data_lines:
         yield "\n".join(data_lines)
+
+
+async def _proxy_openai_chat_once(
+    *,
+    url: str,
+    api_key: str,
+    model_name: str,
+    messages: list[dict[str, Any]],
+    max_tokens: int | None,
+    service_name: str,
+    backend_label: str,
+) -> dict[str, Any]:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    body: dict[str, Any] = {
+        "model": model_name,
+        "messages": _normalize_openai_chat_messages(messages),
+        "stream": False,
+        "enable_thinking": False,
+    }
+    if max_tokens is not None:
+        body["max_tokens"] = max_tokens
+
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        try:
+            response = await client.post(url, json=body, headers=headers)
+        except httpx.HTTPError as exc:
+            detail = str(exc)
+            if _should_restart_backend(detail):
+                await _restart_service_if_needed(service_name)
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"The {backend_label.lower()} disconnected and is being restarted. Wait about 30 seconds, then try again.",
+                ) from exc
+            raise HTTPException(status_code=502, detail=f"{backend_label} connection error: {detail}") from exc
+
+    if response.status_code != 200:
+        detail = response.text[:1200]
+        if response.status_code >= 500 and _should_restart_backend(detail):
+            await _restart_service_if_needed(service_name)
+            raise HTTPException(
+                status_code=503,
+                detail=f"The {backend_label.lower()} crashed and is being restarted. Wait about 30 seconds, then try again.",
+            )
+        raise HTTPException(status_code=502, detail=f"{backend_label} error {response.status_code}: {detail}")
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail=f"{backend_label} returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail=f"{backend_label} returned an unexpected payload shape")
+    return payload
+
+
+async def _proxy_openai_chat_stream(
+    *,
+    url: str,
+    api_key: str,
+    model_name: str,
+    messages: list[dict[str, Any]],
+    max_tokens: int | None,
+    service_name: str,
+    backend_label: str,
+    stop_checker: Callable[[], bool] | None = None,
+):
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    body: dict[str, Any] = {
+        "model": model_name,
+        "messages": _normalize_openai_chat_messages(messages),
+        "stream": True,
+        "enable_thinking": False,
+    }
+    if max_tokens is not None:
+        body["max_tokens"] = max_tokens
+
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        try:
+            async with client.stream("POST", url, json=body, headers=headers) as response:
+                if response.status_code != 200:
+                    detail = (await response.aread()).decode("utf-8", errors="replace")[:1200]
+                    if response.status_code >= 500 and _should_restart_backend(detail):
+                        await _restart_service_if_needed(service_name)
+                        raise HTTPException(
+                            status_code=503,
+                            detail=f"The {backend_label.lower()} crashed and is being restarted. Wait about 30 seconds, then try again.",
+                        )
+                    raise HTTPException(status_code=502, detail=f"{backend_label} error {response.status_code}: {detail}")
+
+                payload_iter = _aiter_sse_payloads(response).__aiter__()
+                while True:
+                    if stop_checker is not None and stop_checker():
+                        return
+                    try:
+                        raw_payload = await asyncio.wait_for(payload_iter.__anext__(), timeout=0.25)
+                    except asyncio.TimeoutError:
+                        continue
+                    except StopAsyncIteration:
+                        break
+                    if raw_payload == "[DONE]":
+                        break
+                    try:
+                        payload = json.loads(raw_payload)
+                    except json.JSONDecodeError as exc:
+                        raise HTTPException(status_code=502, detail=f"{backend_label} returned invalid streaming JSON") from exc
+                    if not isinstance(payload, dict):
+                        continue
+                    choices = payload.get("choices") or []
+                    if not choices or not isinstance(choices[0], dict):
+                        continue
+                    choice = choices[0]
+                    delta = choice.get("delta") or {}
+                    content = str(delta.get("content") or "")
+                    reasoning_content = str(delta.get("reasoning_content") or "")
+                    metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
+                    if content or reasoning_content or metrics:
+                        yield {
+                            "type": "delta",
+                            "content": content,
+                            "reasoning_content": reasoning_content,
+                            "metrics": metrics,
+                            "payload": payload,
+                        }
+                    finish_reason = choice.get("finish_reason")
+                    if finish_reason is not None:
+                        yield {
+                            "type": "finish",
+                            "finish_reason": finish_reason,
+                            "metrics": metrics,
+                            "payload": payload,
+                        }
+        except httpx.HTTPError as exc:
+            detail = str(exc)
+            if _should_restart_backend(detail):
+                await _restart_service_if_needed(service_name)
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"The {backend_label.lower()} disconnected and is being restarted. Wait about 30 seconds, then try again.",
+                ) from exc
+            raise HTTPException(status_code=502, detail=f"{backend_label} connection error: {detail}") from exc
 
 
 def _append_feedback_log(entry: dict[str, Any]) -> None:
@@ -1387,6 +1717,255 @@ async def _proxy_select_profile(profile_id: str) -> dict[str, Any]:
     return _augment_profile_payload(payload)
 
 
+def _parse_systemctl_show(output: str) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        parsed[key] = value
+    return parsed
+
+
+def _systemctl_show(service_name: str) -> dict[str, Any]:
+    if not service_name:
+        return {
+            "unit": "",
+            "description": "",
+            "active": False,
+            "active_state": "inactive",
+            "sub_state": "dead",
+            "unit_file_state": "unknown",
+            "pid": 0,
+            "ok": False,
+        }
+
+    result = subprocess.run(
+        [
+            "systemctl",
+            "--user",
+            "show",
+            service_name,
+            "--property",
+            "Id,Description,ActiveState,SubState,UnitFileState,ExecMainPID",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        return {
+            "unit": service_name,
+            "description": "",
+            "active": False,
+            "active_state": "unknown",
+            "sub_state": "unknown",
+            "unit_file_state": "unknown",
+            "pid": 0,
+            "ok": False,
+            "detail": detail,
+        }
+
+    parsed = _parse_systemctl_show(result.stdout)
+    active_state = str(parsed.get("ActiveState") or "unknown")
+    return {
+        "unit": str(parsed.get("Id") or service_name),
+        "description": str(parsed.get("Description") or ""),
+        "active": active_state == "active",
+        "active_state": active_state,
+        "sub_state": str(parsed.get("SubState") or ""),
+        "unit_file_state": str(parsed.get("UnitFileState") or ""),
+        "pid": int(parsed.get("ExecMainPID") or 0),
+        "ok": result.returncode == 0,
+    }
+
+
+def _systemctl_action(action: str, service_name: str) -> None:
+    if not service_name:
+        return
+    subprocess.run(
+        ["systemctl", "--user", action, service_name],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=60,
+    )
+
+
+def _systemctl_reset_failed(service_name: str) -> None:
+    if not service_name:
+        return
+    subprocess.run(
+        ["systemctl", "--user", "reset-failed", service_name],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=20,
+    )
+
+
+def _stop_service_for_mode_switch(service_name: str) -> None:
+    if not service_name:
+        return
+
+    hard_stop = service_name == CHAT_SERVICE_NAME and CHAT_BACKEND_MODE == "openai_chat"
+    if hard_stop:
+        subprocess.run(
+            ["systemctl", "--user", "kill", "-s", "SIGKILL", service_name],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+        )
+        time.sleep(1)
+
+    subprocess.run(
+        ["systemctl", "--user", "stop", service_name],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=60,
+    )
+    _systemctl_reset_failed(service_name)
+
+
+def _determine_gpu_mode(
+    *,
+    openclaw_chat_service: dict[str, Any],
+    openclaw_training_service: dict[str, Any],
+    heretic_service: dict[str, Any],
+) -> str:
+    openclaw_active = bool(openclaw_chat_service.get("active")) or bool(openclaw_training_service.get("active"))
+    openclaw_ready = bool(openclaw_chat_service.get("active")) and bool(openclaw_training_service.get("active"))
+    heretic_active = bool(heretic_service.get("active"))
+
+    if openclaw_ready and not heretic_active:
+        return GPU_MODE_OPENCLAW
+    if heretic_active and not openclaw_active:
+        return GPU_MODE_HERETIC
+    if openclaw_active and heretic_active:
+        return GPU_MODE_MIXED
+    if openclaw_active or heretic_active:
+        return GPU_MODE_TRANSITIONING
+    return GPU_MODE_IDLE
+
+
+def _gpu_mode_label(mode: str) -> str:
+    if mode == GPU_MODE_OPENCLAW:
+        return "OpenClaw RL"
+    if mode == GPU_MODE_HERETIC:
+        return "27B Chat"
+    if mode == GPU_MODE_MIXED:
+        return "Mixed"
+    if mode == GPU_MODE_TRANSITIONING:
+        return "Switching"
+    return "No GPU mode"
+
+
+async def _build_model_control_status() -> dict[str, Any]:
+    openclaw_chat_service, openclaw_training_service, heretic_service, openclaw_health, heretic_health = await asyncio.gather(
+        asyncio.to_thread(_systemctl_show, CHAT_SERVICE_NAME),
+        asyncio.to_thread(_systemctl_show, TRAINING_SERVICE_NAME),
+        asyncio.to_thread(_systemctl_show, HERETIC_SERVICE_NAME),
+        _proxy_health(),
+        _fetch_health(HERETIC_HEALTH_URL),
+    )
+
+    active_mode = _determine_gpu_mode(
+        openclaw_chat_service=openclaw_chat_service,
+        openclaw_training_service=openclaw_training_service,
+        heretic_service=heretic_service,
+    )
+    openclaw_ready = (
+        bool(openclaw_chat_service.get("active"))
+        and bool(openclaw_training_service.get("active"))
+        and bool(openclaw_health.get("ok"))
+    )
+    heretic_ready = bool(heretic_service.get("active")) and bool(heretic_health.get("ok"))
+
+    return {
+        "ok": True,
+        "active_mode": active_mode,
+        "mode_label": _gpu_mode_label(active_mode),
+        "openclaw": {
+            "mode": GPU_MODE_OPENCLAW,
+            "label": "OpenClaw RL",
+            "ready": openclaw_ready,
+            "service_chat": openclaw_chat_service,
+            "service_training": openclaw_training_service,
+            "health": openclaw_health,
+            "model": MODEL_NAME,
+        },
+        "heretic": {
+            "mode": GPU_MODE_HERETIC,
+            "label": "27B Chat",
+            "ready": heretic_ready,
+            "service": heretic_service,
+            "health": heretic_health,
+            "model": HERETIC_MODEL_NAME,
+        },
+    }
+
+
+async def _wait_for_target_mode(target_mode: str) -> dict[str, Any]:
+    deadline = time.time() + MODEL_SWITCH_WAIT_SECONDS
+    while True:
+        status = await _build_model_control_status()
+        if target_mode == GPU_MODE_OPENCLAW:
+            if status["active_mode"] == GPU_MODE_OPENCLAW and bool(status["openclaw"]["ready"]):
+                return status
+        elif target_mode == GPU_MODE_HERETIC:
+            if status["active_mode"] == GPU_MODE_HERETIC and bool(status["heretic"]["ready"]):
+                return status
+        else:
+            return status
+
+        if time.time() >= deadline:
+            return status
+        await asyncio.sleep(2)
+
+
+async def _switch_gpu_mode(target_mode: str) -> dict[str, Any]:
+    if target_mode not in {GPU_MODE_OPENCLAW, GPU_MODE_HERETIC}:
+        raise HTTPException(status_code=400, detail="Unsupported GPU mode")
+    if _has_any_busy_sessions():
+        raise HTTPException(status_code=409, detail="A response is still streaming. Stop it before switching GPU modes.")
+
+    if target_mode == GPU_MODE_OPENCLAW:
+        await asyncio.to_thread(_stop_service_for_mode_switch, HERETIC_SERVICE_NAME)
+        await asyncio.to_thread(_systemctl_action, "start", CHAT_SERVICE_NAME)
+        await asyncio.to_thread(_systemctl_action, "start", TRAINING_SERVICE_NAME)
+    else:
+        await asyncio.to_thread(_stop_service_for_mode_switch, TRAINING_SERVICE_NAME)
+        await asyncio.to_thread(_stop_service_for_mode_switch, CHAT_SERVICE_NAME)
+        await asyncio.to_thread(_systemctl_action, "start", HERETIC_SERVICE_NAME)
+
+    return await _wait_for_target_mode(target_mode)
+
+
+def _openclaw_mode_error(status: dict[str, Any]) -> HTTPException:
+    mode_label = status.get("mode_label") or "another mode"
+    if status.get("active_mode") != GPU_MODE_OPENCLAW:
+        return HTTPException(
+            status_code=409,
+            detail=f"OpenClaw Chat is inactive because GPU mode is set to {mode_label}. Switch back in Model Control.",
+        )
+    return HTTPException(status_code=503, detail="OpenClaw RL is starting up. Wait a moment and try again.")
+
+
+def _heretic_mode_error(status: dict[str, Any]) -> HTTPException:
+    mode_label = status.get("mode_label") or "another mode"
+    if status.get("active_mode") != GPU_MODE_HERETIC:
+        return HTTPException(
+            status_code=409,
+            detail=f"27B Chat is inactive because GPU mode is set to {mode_label}. Switch to 27B Chat in Model Control.",
+        )
+    return HTTPException(status_code=503, detail="27B Chat is starting up. Wait a moment and try again.")
+
+
 def _should_restart_backend(detail: str) -> bool:
     lowered = detail.lower()
     markers = (
@@ -1499,12 +2078,38 @@ async def api_state(request: Request) -> JSONResponse:
 @app.get("/api/status")
 async def api_status(request: Request) -> JSONResponse:
     browser_id, state, created = _ensure_browser_session(request)
+    model_control = await _build_model_control_status()
     payload = {
         "ok": True,
         "state": {
             **_serialize_state(state),
             "proxy": await _proxy_health(),
+            "model_control": model_control,
         },
+    }
+    return _response_with_cookie(payload, browser_id, created)
+
+
+@app.get("/api/model-control")
+async def api_model_control(request: Request) -> JSONResponse:
+    browser_id, state, created = _ensure_browser_session(request)
+    payload = {
+        "ok": True,
+        "model_control": await _build_model_control_status(),
+        "state": _serialize_state(state),
+    }
+    return _response_with_cookie(payload, browser_id, created)
+
+
+@app.post("/api/model-control/switch")
+async def api_model_control_switch(request: Request, body: ModelControlSwitchRequest) -> JSONResponse:
+    browser_id, state, created = _ensure_browser_session(request)
+    mode = body.mode.strip().lower()
+    status = await _switch_gpu_mode(mode)
+    payload = {
+        "ok": True,
+        "model_control": status,
+        "state": _serialize_state(state),
     }
     return _response_with_cookie(payload, browser_id, created)
 
@@ -1628,6 +2233,9 @@ async def api_chat_stream(request: Request, body: ChatRequest) -> StreamingRespo
     prompt = body.prompt.strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+    mode_status = await _build_model_control_status()
+    if mode_status.get("active_mode") != GPU_MODE_OPENCLAW or not bool(mode_status["openclaw"]["ready"]):
+        raise _openclaw_mode_error(mode_status)
 
     browser_id, _, created = _ensure_browser_session(request)
     with _state_lock:
@@ -1939,11 +2547,305 @@ async def api_chat_stop(request: Request) -> JSONResponse:
     return _response_with_cookie(payload, browser_id, created)
 
 
+@app.post("/api/heretic/chat/stream")
+async def api_heretic_chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
+    prompt = body.prompt.strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+
+    mode_status = await _build_model_control_status()
+    if mode_status.get("active_mode") != GPU_MODE_HERETIC or not bool(mode_status["heretic"]["ready"]):
+        raise _heretic_mode_error(mode_status)
+
+    browser_id, _, created = _ensure_browser_session(request)
+    with _state_lock:
+        state = _browser_sessions[browser_id]
+        if state["busy"] or state.get("heretic_busy"):
+            raise HTTPException(status_code=409, detail="Another request is already running")
+        state["heretic_busy"] = True
+        state["heretic_stream_stop_requested"] = False
+        transcript_messages = _trim_transcript_messages(state.get("heretic_transcript") or [])
+        _touch_state(state)
+
+    user_turn = {
+        "id": uuid.uuid4().hex,
+        "role": "user",
+        "content": prompt,
+        "created_at": time.time(),
+        "feedback_pending": False,
+    }
+    assistant_turn = {
+        "id": uuid.uuid4().hex,
+        "role": "assistant",
+        "content": "",
+        "created_at": time.time(),
+        "feedback": None,
+        "feedback_pending": False,
+        "reasoning": "",
+        "thinking_enabled": False,
+        "streaming": True,
+        "metrics": None,
+    }
+    prompt_messages = [
+        {"role": "system", "content": HERETIC_PLAIN_ANSWER_SYSTEM_PROMPT},
+        *transcript_messages,
+        {"role": "user", "content": prompt},
+    ]
+    retry_prompt_messages = [
+        {"role": "system", "content": HERETIC_PLAIN_ANSWER_SYSTEM_PROMPT},
+        {"role": "system", "content": HERETIC_RETRY_SYSTEM_PROMPT},
+        *transcript_messages,
+        {"role": "user", "content": prompt},
+    ]
+
+    async def event_stream():
+        committed = False
+        stop_requested = False
+        final_text = ""
+        final_reasoning = ""
+        last_metrics: dict[str, Any] | None = None
+        finish_reason = "stop"
+        stream_started_at = time.perf_counter()
+        first_token_at: float | None = None
+
+        try:
+            yield _sse_event(
+                "start",
+                {
+                    "user_turn": user_turn,
+                    "assistant_turn": assistant_turn,
+                },
+            )
+
+            async for event in _proxy_openai_chat_stream(
+                url=HERETIC_CHAT_URL,
+                api_key=HERETIC_API_KEY,
+                model_name=HERETIC_MODEL_NAME,
+                messages=prompt_messages,
+                max_tokens=HERETIC_UI_MAX_TOKENS,
+                service_name=HERETIC_SERVICE_NAME,
+                backend_label="27B chat backend",
+                stop_checker=lambda: _is_heretic_stream_stop_requested(browser_id),
+            ):
+                if await request.is_disconnected():
+                    raise asyncio.CancelledError()
+                if _is_heretic_stream_stop_requested(browser_id):
+                    stop_requested = True
+                    finish_reason = "stop"
+                    break
+
+                if event["type"] == "delta":
+                    raw_metrics = event.get("metrics") or {}
+                    delta = str(event.get("content") or "")
+                    reasoning_delta = str(event.get("reasoning_content") or "")
+                    if not delta and not reasoning_delta and not raw_metrics:
+                        continue
+                    if first_token_at is None and (delta or reasoning_delta or raw_metrics):
+                        first_token_at = time.perf_counter()
+                    if delta:
+                        final_text += delta
+                    if reasoning_delta:
+                        final_reasoning += reasoning_delta
+                    last_metrics = _stream_metrics_fallback(
+                        raw_metrics,
+                        visible_text="",
+                        reasoning_text=final_reasoning,
+                        started_at=stream_started_at,
+                        first_token_at=first_token_at,
+                    )
+                    continue
+
+                if event["type"] == "finish":
+                    finish_reason = str(event.get("finish_reason") or "stop")
+                    last_metrics = _stream_metrics_fallback(
+                        event.get("metrics") or last_metrics,
+                        visible_text=final_text,
+                        reasoning_text=final_reasoning,
+                        started_at=stream_started_at,
+                        first_token_at=first_token_at,
+                    )
+
+            stop_requested = stop_requested or _is_heretic_stream_stop_requested(browser_id)
+            assistant_reasoning = ""
+            assistant_text = _resolve_heretic_assistant_text(final_text, final_reasoning, prompt=prompt)
+            needs_retry = not stop_requested and _heretic_response_needs_retry(
+                final_text,
+                final_reasoning,
+                assistant_text,
+                prompt=prompt,
+            )
+
+            if not stop_requested and (not assistant_text or needs_retry):
+                for _attempt in range(3):
+                    fallback_response = await _proxy_openai_chat_once(
+                        url=HERETIC_CHAT_URL,
+                        api_key=HERETIC_API_KEY,
+                        model_name=HERETIC_MODEL_NAME,
+                        messages=retry_prompt_messages,
+                        max_tokens=min(HERETIC_UI_MAX_TOKENS, 32),
+                        service_name=HERETIC_SERVICE_NAME,
+                        backend_label="27B chat backend",
+                    )
+                    choice = (fallback_response.get("choices") or [{}])[0]
+                    assistant_message = choice.get("message") or {}
+                    fallback_reasoning = str(assistant_message.get("reasoning_content") or "")
+                    fallback_content = str(assistant_message.get("content") or "")
+                    assistant_text = _resolve_heretic_assistant_text(
+                        fallback_content,
+                        fallback_reasoning,
+                        prompt=prompt,
+                    )
+                    if assistant_text and not _heretic_response_needs_retry(
+                        fallback_content,
+                        fallback_reasoning,
+                        assistant_text,
+                        prompt=prompt,
+                    ):
+                        assistant_reasoning = ""
+                        last_metrics = _heretic_metrics_from_payload(
+                            fallback_response,
+                            assistant_text=assistant_text,
+                            started_at=stream_started_at,
+                            first_token_at=first_token_at,
+                        )
+                        break
+
+            if stop_requested and not assistant_text and not assistant_reasoning:
+                with _state_lock:
+                    state = _browser_sessions[browser_id]
+                    state["heretic_busy"] = False
+                    state["heretic_stream_stop_requested"] = False
+                    _touch_state(state)
+                    serialized_state = _serialize_state(state)
+                committed = True
+                yield _sse_event("state", {"state": serialized_state})
+                return
+
+            if not assistant_text and not assistant_reasoning:
+                raise HTTPException(status_code=502, detail="27B model returned malformed think-tag output")
+
+            last_metrics = _stream_metrics_fallback(
+                last_metrics,
+                visible_text=assistant_text,
+                reasoning_text=assistant_reasoning,
+                started_at=stream_started_at,
+                first_token_at=first_token_at,
+            )
+            yield _sse_event(
+                "delta",
+                {
+                    "assistant_turn_id": assistant_turn["id"],
+                    "delta": assistant_text,
+                    "reasoning_delta": "",
+                    "metrics": last_metrics,
+                },
+            )
+            yield _sse_event(
+                "final",
+                {
+                    "assistant_turn_id": assistant_turn["id"],
+                    "finish_reason": finish_reason,
+                    "metrics": last_metrics or {},
+                },
+            )
+
+            completed_assistant_turn = {
+                **assistant_turn,
+                "content": assistant_text,
+                "reasoning": assistant_reasoning,
+                "streaming": False,
+                "metrics": last_metrics,
+                "feedback_pending": False,
+            }
+
+            with _state_lock:
+                state = _browser_sessions[browser_id]
+                state["heretic_transcript"] = [
+                    *(state.get("heretic_transcript") or []),
+                    user_turn,
+                    completed_assistant_turn,
+                ]
+                state["heretic_busy"] = False
+                state["heretic_stream_stop_requested"] = False
+                _touch_state(state)
+                serialized_state = _serialize_state(state)
+
+            committed = True
+            yield _sse_event("state", {"state": serialized_state})
+        except asyncio.CancelledError:
+            with _state_lock:
+                state = _browser_sessions[browser_id]
+                state["heretic_busy"] = False
+                state["heretic_stream_stop_requested"] = False
+                _touch_state(state)
+            raise
+        except Exception as exc:
+            with _state_lock:
+                state = _browser_sessions[browser_id]
+                state["heretic_busy"] = False
+                state["heretic_stream_stop_requested"] = False
+                _touch_state(state)
+            detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+            yield _sse_event("error", {"detail": detail or "Streaming failed"})
+        finally:
+            if not committed:
+                with _state_lock:
+                    state = _browser_sessions[browser_id]
+                    state["heretic_busy"] = False
+                    state["heretic_stream_stop_requested"] = False
+                    _touch_state(state)
+
+    response = StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+    _set_cookie_on_response(response, browser_id, created)
+    return response
+
+
+@app.post("/api/heretic/chat/stop")
+async def api_heretic_chat_stop(request: Request) -> JSONResponse:
+    browser_id, _, created = _ensure_browser_session(request)
+    with _state_lock:
+        state = _browser_sessions[browser_id]
+        if state.get("heretic_busy"):
+            state["heretic_stream_stop_requested"] = True
+        _touch_state(state)
+        payload = {
+            "ok": True,
+            "stop_requested": bool(state.get("heretic_busy")),
+            "state": _serialize_state(state),
+        }
+    return _response_with_cookie(payload, browser_id, created)
+
+
+@app.post("/api/heretic/reset")
+async def api_heretic_reset(request: Request) -> JSONResponse:
+    browser_id, _, created = _ensure_browser_session(request)
+    with _state_lock:
+        state = _browser_sessions[browser_id]
+        if state.get("busy") or state.get("heretic_busy"):
+            raise HTTPException(status_code=409, detail="Another request is already running")
+        state["heretic_transcript"] = []
+        state["heretic_stream_stop_requested"] = False
+        _touch_state(state)
+        payload = {"ok": True, "state": _serialize_state(state)}
+    return _response_with_cookie(payload, browser_id, created)
+
+
 @app.post("/api/chat")
 async def api_chat(request: Request, body: ChatRequest) -> JSONResponse:
     prompt = body.prompt.strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+    mode_status = await _build_model_control_status()
+    if mode_status.get("active_mode") != GPU_MODE_OPENCLAW or not bool(mode_status["openclaw"]["ready"]):
+        raise _openclaw_mode_error(mode_status)
 
     browser_id, _, created = _ensure_browser_session(request)
     with _state_lock:
@@ -2044,6 +2946,9 @@ async def api_chat(request: Request, body: ChatRequest) -> JSONResponse:
 
 @app.post("/api/feedback")
 async def api_feedback(request: Request, body: FeedbackRequest) -> JSONResponse:
+    mode_status = await _build_model_control_status()
+    if mode_status.get("active_mode") != GPU_MODE_OPENCLAW or not bool(mode_status["openclaw"]["ready"]):
+        raise _openclaw_mode_error(mode_status)
     browser_id, _, created = _ensure_browser_session(request)
     score = body.score
     if score is None:

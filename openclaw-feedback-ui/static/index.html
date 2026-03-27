@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>OpenClaw OS</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260326g" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260326m" />
   </head>
   <body>
     <div class="app-shell" id="app-shell">
@@ -22,6 +22,14 @@
           <button class="launcher-app" data-open-app="chat" type="button">
             <span class="launcher-icon" aria-hidden="true">◉</span>
             <span class="launcher-label">Chat</span>
+          </button>
+          <button class="launcher-app" data-open-app="heretic" type="button">
+            <span class="launcher-icon" aria-hidden="true">◌</span>
+            <span class="launcher-label">27B Chat</span>
+          </button>
+          <button class="launcher-app" data-open-app="model-control" type="button">
+            <span class="launcher-icon" aria-hidden="true">⇄</span>
+            <span class="launcher-label">Models</span>
           </button>
           <button class="launcher-app" data-open-app="calendar" type="button">
             <span class="launcher-icon" aria-hidden="true">▦</span>
@@ -56,6 +64,7 @@
           </div>
           <div class="titlebar-meta">
             <div class="status-chip" id="proxy-status">Checking trainer...</div>
+            <div class="model-pill" id="gpu-mode-pill">GPU mode</div>
             <div class="model-pill" id="model-label">Model</div>
             <button class="thinking-toggle" id="thinking-toggle" type="button" aria-pressed="false">
               Thinking off
@@ -77,6 +86,8 @@
                   Start a new chat to create the first saved conversation for this profile.
                 </div>
                 <div class="sidebar-footer">
+                  <button class="sidebar-utility-button" data-open-app="heretic" type="button">27B Chat</button>
+                  <button class="sidebar-utility-button" data-open-app="model-control" type="button">Models</button>
                   <button class="sidebar-utility-button" data-open-app="notes" type="button">Notes</button>
                   <button class="sidebar-utility-button" data-open-app="profiles" type="button">Profiles</button>
                   <button class="sidebar-utility-button" data-open-app="calendar" type="button">Calendar</button>
@@ -104,6 +115,102 @@
                   </div>
                 </section>
               </section>
+            </div>
+          </section>
+
+          <section class="app-view heretic-app-view hidden" data-app-view="heretic" aria-hidden="true">
+            <div class="heretic-shell">
+              <div class="app-view-head">
+                <div>
+                  <p class="eyebrow">SIDECAR CHAT</p>
+                  <h2>27B Chat</h2>
+                  <p class="workspace-summary">
+                    A separate 27B sidecar lane for straight conversation. No RL feedback loop, no trainer controls.
+                  </p>
+                </div>
+                <div class="calendar-toolbar">
+                  <div class="model-pill" id="heretic-status-chip">Checking 27B Chat...</div>
+                  <button class="secondary-button" id="heretic-reset-button" type="button">New chat</button>
+                </div>
+              </div>
+
+              <section class="transcript-shell heretic-transcript-shell">
+                <div class="transcript heretic-transcript" id="heretic-transcript"></div>
+                <div class="empty-state" id="heretic-empty-state">
+                  <div class="empty-orb" aria-hidden="true"></div>
+                  <h2>27B Chat is ready when the GPUs are.</h2>
+                  <p>
+                    Switch GPU mode in Model Control, then use this app for simple non-RL chat with the active 27B sidecar model.
+                  </p>
+                </div>
+              </section>
+
+              <section class="composer-shell">
+                <div class="composer-frame">
+                  <textarea id="heretic-prompt-input" rows="1" placeholder="Talk to the 27B sidecar..."></textarea>
+                  <button class="send-button" id="heretic-send-button" type="button" aria-label="Send 27B chat message">
+                    <span class="send-button-icon" id="heretic-send-button-icon" aria-hidden="true">&#10148;</span>
+                  </button>
+                </div>
+              </section>
+            </div>
+          </section>
+
+          <section class="app-view model-control-app-view hidden" data-app-view="model-control" aria-hidden="true">
+            <div class="model-control-shell">
+              <div class="app-view-head">
+                <div>
+                  <p class="eyebrow">GPU OWNERSHIP</p>
+                  <h2>Model Control</h2>
+                  <p class="workspace-summary">
+                    The same two GPUs can run either the live OpenClaw RL lane or the 27B sidecar chat lane. Pick one
+                    clearly and the shell will tell the truth about what is active.
+                  </p>
+                </div>
+                <div class="model-pill" id="model-control-mode-pill">Checking mode...</div>
+              </div>
+
+              <div class="model-control-layout">
+                <article class="mode-card" id="openclaw-mode-card">
+                  <div class="mode-card-head">
+                    <div>
+                      <p class="eyebrow">TRAINABLE RL LANE</p>
+                      <h3>OpenClaw RL</h3>
+                    </div>
+                    <div class="model-pill" id="openclaw-mode-status">Unknown</div>
+                  </div>
+                  <p class="mode-card-copy">
+                    Runs the current OpenClaw Chat stack: Qwen3.5-4B, SGLang, profiles, sessions, and RL feedback.
+                  </p>
+                  <div class="profile-stats">
+                    <span class="profile-stat" id="openclaw-mode-model">Model</span>
+                    <span class="profile-stat" id="openclaw-mode-health">Health</span>
+                  </div>
+                  <button class="primary-button full-width-button" id="openclaw-mode-button" type="button">
+                    Use OpenClaw RL
+                  </button>
+                </article>
+
+                <article class="mode-card" id="heretic-mode-card">
+                  <div class="mode-card-head">
+                    <div>
+                      <p class="eyebrow">SIDECAR CHAT LANE</p>
+                      <h3>27B Chat</h3>
+                    </div>
+                    <div class="model-pill" id="heretic-mode-status">Unknown</div>
+                  </div>
+                  <p class="mode-card-copy">
+                    Runs the active 27B sidecar chat stack as a separate app. No live RL trainer, no feedback controls.
+                  </p>
+                  <div class="profile-stats">
+                    <span class="profile-stat" id="heretic-mode-model">Model</span>
+                    <span class="profile-stat" id="heretic-mode-health">Health</span>
+                  </div>
+                  <button class="primary-button full-width-button" id="heretic-mode-button" type="button">
+                    Use 27B Chat
+                  </button>
+                </article>
+              </div>
             </div>
           </section>
 
@@ -282,6 +389,6 @@
       </article>
     </template>
 
-    <script src="/static/app.js?v=20260326g"></script>
+    <script src="/static/app.js?v=20260326m"></script>
   </body>
 </html>

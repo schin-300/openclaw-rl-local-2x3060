@@ -1,10 +1,14 @@
 const state = {
   transcript: [],
+  hereticTranscript: [],
   sessions: [],
   activeSessionId: "",
   busy: false,
+  hereticBusy: false,
   stopRequested: false,
+  hereticStopRequested: false,
   model: "",
+  hereticModel: "",
   backendMode: "rl_proxy",
   chatBackendMode: "rl_proxy",
   trainingBackendMode: "rl_proxy",
@@ -18,6 +22,9 @@ const state = {
   activeProfileId: "",
   profiles: [],
   activeApp: "chat",
+  modelControl: null,
+  gpuMode: "",
+  gpuModeLabel: "",
   calendarMonthAnchor: "",
   calendarSelectedDateKey: "",
   calendarEvents: {},
@@ -33,6 +40,18 @@ const APP_REGISTRY = {
     title: "OpenClaw Chat",
     eyebrow: "LIVE RL CHAT",
     summary: "Stay in the feedback loop, stream replies live, and keep your training flow intact.",
+  },
+  heretic: {
+    id: "heretic",
+    title: "27B Chat",
+    eyebrow: "SIDECAR CHAT",
+    summary: "A separate simple 27B chat lane with no RL controls mixed in.",
+  },
+  "model-control": {
+    id: "model-control",
+    title: "Model Control",
+    eyebrow: "GPU OWNERSHIP",
+    summary: "Assign the machine's two GPUs to either the live OpenClaw RL lane or the separate 27B chat lane.",
   },
   calendar: {
     id: "calendar",
@@ -63,11 +82,19 @@ const els = {
   sendButton: document.getElementById("send-button"),
   sendButtonIcon: document.querySelector("#send-button .send-button-icon"),
   promptInput: document.getElementById("prompt-input"),
+  hereticTranscript: document.getElementById("heretic-transcript"),
+  hereticEmptyState: document.getElementById("heretic-empty-state"),
+  hereticPromptInput: document.getElementById("heretic-prompt-input"),
+  hereticSendButton: document.getElementById("heretic-send-button"),
+  hereticSendButtonIcon: document.getElementById("heretic-send-button-icon"),
+  hereticResetButton: document.getElementById("heretic-reset-button"),
+  hereticStatusChip: document.getElementById("heretic-status-chip"),
   systemPromptInput: document.getElementById("system-prompt-input"),
   guidanceInput: document.getElementById("guidance-input"),
   guidanceSaveButton: document.getElementById("guidance-save-button"),
   guidanceStatus: document.getElementById("guidance-status"),
   proxyStatus: document.getElementById("proxy-status"),
+  gpuModePill: document.getElementById("gpu-mode-pill"),
   modelLabel: document.getElementById("model-label"),
   windowModelTitle: document.getElementById("window-model-title"),
   windowModelEyebrow: document.getElementById("window-model-eyebrow"),
@@ -95,6 +122,17 @@ const els = {
   calendarClearButton: document.getElementById("calendar-clear-button"),
   calendarPrevMonth: document.getElementById("calendar-prev-month"),
   calendarNextMonth: document.getElementById("calendar-next-month"),
+  modelControlModePill: document.getElementById("model-control-mode-pill"),
+  openclawModeCard: document.getElementById("openclaw-mode-card"),
+  hereticModeCard: document.getElementById("heretic-mode-card"),
+  openclawModeStatus: document.getElementById("openclaw-mode-status"),
+  hereticModeStatus: document.getElementById("heretic-mode-status"),
+  openclawModeModel: document.getElementById("openclaw-mode-model"),
+  hereticModeModel: document.getElementById("heretic-mode-model"),
+  openclawModeHealth: document.getElementById("openclaw-mode-health"),
+  hereticModeHealth: document.getElementById("heretic-mode-health"),
+  openclawModeButton: document.getElementById("openclaw-mode-button"),
+  hereticModeButton: document.getElementById("heretic-mode-button"),
   messageTemplate: document.getElementById("message-template"),
 };
 
@@ -325,19 +363,58 @@ function autoResizeComposer() {
   els.promptInput.style.height = `${nextHeight}px`;
 }
 
-function isTranscriptNearBottom() {
-  if (!els.transcript) {
+function autoResizeHereticComposer() {
+  if (!els.hereticPromptInput) {
+    return;
+  }
+  els.hereticPromptInput.style.height = "auto";
+  const nextHeight = Math.min(Math.max(els.hereticPromptInput.scrollHeight, 24), 160);
+  els.hereticPromptInput.style.height = `${nextHeight}px`;
+}
+
+function isContainerNearBottom(container) {
+  if (!container) {
     return true;
   }
   const threshold = 96;
-  const distanceFromBottom =
-    els.transcript.scrollHeight - els.transcript.scrollTop - els.transcript.clientHeight;
+  const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
   return distanceFromBottom <= threshold;
 }
 
+function isTranscriptNearBottom() {
+  return isContainerNearBottom(els.transcript);
+}
+
+function isHereticTranscriptNearBottom() {
+  return isContainerNearBottom(els.hereticTranscript);
+}
+
+function scrollContainerToBottom(container) {
+  if (container) {
+    container.scrollTop = container.scrollHeight;
+  }
+}
+
 function scrollTranscriptToBottom() {
-  if (els.transcript) {
-    els.transcript.scrollTop = els.transcript.scrollHeight;
+  scrollContainerToBottom(els.transcript);
+}
+
+function scrollHereticTranscriptToBottom() {
+  scrollContainerToBottom(els.hereticTranscript);
+}
+
+function renderMessageList(container, emptyState, items, { shouldStick = false, messageOptions = {} } = {}) {
+  if (!container || !emptyState) {
+    return;
+  }
+  container.innerHTML = "";
+  const hasMessages = items.length > 0;
+  emptyState.classList.toggle("hidden", hasMessages);
+  for (const item of items) {
+    container.appendChild(buildTranscriptMessage(item, messageOptions));
+  }
+  if (shouldStick) {
+    scrollContainerToBottom(container);
   }
 }
 
@@ -358,10 +435,19 @@ function setBusy(isBusy) {
   if (!isBusy) {
     state.stopRequested = false;
   }
-  document.body.classList.toggle("busy", isBusy);
+  document.body.classList.toggle("busy", isBusy || state.hereticBusy);
   renderControls();
   syncTranscriptBusyState();
   renderSessions();
+}
+
+function setHereticBusy(isBusy) {
+  state.hereticBusy = isBusy;
+  if (!isBusy) {
+    state.hereticStopRequested = false;
+  }
+  document.body.classList.toggle("busy", isBusy || state.busy);
+  renderControls();
 }
 
 function upsertStreamingTurn(turn) {
@@ -444,6 +530,32 @@ function finalizeStoppedStream() {
   renderTranscript();
 }
 
+function finalizeStoppedHereticStream() {
+  const persistedTurns = state.hereticTranscript.filter((item) => !item.ephemeral);
+  const userTurn = state.hereticTranscript.find((item) => item.ephemeral && item.role === "user");
+  const assistantTurn = state.hereticTranscript.find((item) => item.ephemeral && item.role === "assistant");
+  const hasAssistantContent = Boolean(
+    assistantTurn && (String(assistantTurn.content || "").trim() || String(assistantTurn.reasoning || "").trim())
+  );
+
+  if (userTurn) {
+    persistedTurns.push({ ...userTurn, ephemeral: false });
+  }
+  if (assistantTurn && hasAssistantContent) {
+    persistedTurns.push({
+      ...assistantTurn,
+      ephemeral: false,
+      streaming: false,
+      feedback_pending: false,
+      stopped: true,
+    });
+  }
+
+  state.hereticTranscript = persistedTurns;
+  setHereticBusy(false);
+  renderHereticTranscript();
+}
+
 function updateProfileLabels() {
   const activeProfile = getActiveProfile();
   const profileLabel = activeProfile ? activeProfile.name : state.activeProfileId || "Default";
@@ -462,9 +574,17 @@ function getAppMeta(appId = state.activeApp) {
   return APP_REGISTRY[appId] || APP_REGISTRY.chat;
 }
 
+function getActiveModeModelLabel() {
+  if (state.gpuMode === "heretic_chat") {
+    return state.hereticModel || "27B sidecar model";
+  }
+  return state.model || "Model";
+}
+
 function renderShell() {
   const appMeta = getAppMeta();
   const chatActive = state.activeApp === "chat";
+  const showProfilePill = ["chat", "notes", "profiles"].includes(state.activeApp);
 
   if (els.windowModelEyebrow) {
     els.windowModelEyebrow.textContent = appMeta.eyebrow;
@@ -479,7 +599,7 @@ function renderShell() {
     els.thinkingToggle.classList.toggle("hidden", !chatActive);
   }
   if (els.chatActiveProfile) {
-    els.chatActiveProfile.classList.toggle("hidden", state.activeApp === "calendar");
+    els.chatActiveProfile.classList.toggle("hidden", !showProfilePill);
   }
 
   for (const button of els.appLauncherButtons) {
@@ -502,8 +622,16 @@ function activateApp(appId) {
   state.activeApp = appId;
   saveActiveApp();
   renderShell();
+  renderControls();
+  renderStatus();
   if (appId === "calendar") {
     renderCalendar();
+  }
+  if (appId === "heretic") {
+    renderHereticTranscript();
+  }
+  if (appId === "model-control") {
+    renderModelControl();
   }
 }
 
@@ -647,6 +775,7 @@ function renderProfiles() {
     return;
   }
 
+  const openclawLaneActive = !state.gpuMode || state.gpuMode === "openclaw_rl";
   els.profilesList.innerHTML = "";
   const profiles = Array.isArray(state.profiles) ? state.profiles : [];
   els.profilesEmpty.classList.toggle("hidden", profiles.length > 0);
@@ -709,7 +838,7 @@ function renderProfiles() {
     button.className = "profile-activate-button";
     button.type = "button";
     button.textContent = profile.id === state.activeProfileId ? "Current profile" : "Switch to profile";
-    button.disabled = profile.id === state.activeProfileId || state.busy;
+    button.disabled = profile.id === state.activeProfileId || state.busy || !openclawLaneActive;
     button.addEventListener("click", () => {
       selectProfile(profile.id);
     });
@@ -727,6 +856,7 @@ function renderSessions() {
     return;
   }
 
+  const openclawLaneActive = !state.gpuMode || state.gpuMode === "openclaw_rl";
   els.sessionList.innerHTML = "";
   const sessions = Array.isArray(state.sessions) ? state.sessions : [];
   els.sessionsEmpty.classList.toggle("hidden", sessions.length > 0);
@@ -738,7 +868,7 @@ function renderSessions() {
     if (session.id === state.activeSessionId) {
       button.classList.add("active-session");
     }
-    button.disabled = state.busy && session.id !== state.activeSessionId;
+    button.disabled = !openclawLaneActive || (state.busy && session.id !== state.activeSessionId);
     button.addEventListener("click", () => {
       selectSession(session.id);
     });
@@ -771,6 +901,63 @@ function renderSessions() {
 function renderStatus() {
   if (!els.proxyStatus) {
     return;
+  }
+
+  if (state.activeApp === "chat" && state.gpuMode && state.gpuMode !== "openclaw_rl") {
+    els.proxyStatus.className = "status-chip status-bad";
+    els.proxyStatus.textContent = "OpenClaw lane inactive";
+    return;
+  }
+
+  if (state.activeApp === "heretic") {
+    els.proxyStatus.className = "status-chip";
+    if (!state.modelControl) {
+      els.proxyStatus.textContent = "Checking 27B Chat...";
+      return;
+    }
+    if (state.gpuMode !== "heretic_chat") {
+      els.proxyStatus.textContent = "27B lane inactive";
+      els.proxyStatus.classList.add("status-bad");
+      return;
+    }
+    const hereticReady = Boolean(state.modelControl?.heretic?.ready);
+    els.proxyStatus.textContent = hereticReady ? "27B chat connected" : "27B chat unavailable";
+    els.proxyStatus.classList.add(hereticReady ? "status-good" : "status-bad");
+    return;
+  }
+
+  if (state.activeApp === "model-control") {
+    els.proxyStatus.className = "status-chip";
+    if (!state.modelControl) {
+      els.proxyStatus.textContent = "Checking GPU mode...";
+      return;
+    }
+    els.proxyStatus.textContent = `GPU mode: ${state.gpuModeLabel || "Unknown"}`;
+    els.proxyStatus.classList.add(
+      state.gpuMode === "openclaw_rl" || state.gpuMode === "heretic_chat" ? "status-good" : "status-bad"
+    );
+    return;
+  }
+
+  if (state.activeApp !== "chat" && state.activeApp !== "heretic") {
+    els.proxyStatus.className = "status-chip";
+    if (!state.modelControl) {
+      els.proxyStatus.textContent = "Checking GPU mode...";
+      return;
+    }
+    if (state.gpuMode === "heretic_chat") {
+      const hereticReady = Boolean(state.modelControl?.heretic?.ready);
+      els.proxyStatus.textContent = hereticReady ? "27B chat connected" : "27B chat unavailable";
+      els.proxyStatus.classList.add(hereticReady ? "status-good" : "status-bad");
+      return;
+    }
+    if (state.gpuMode && state.gpuMode !== "openclaw_rl") {
+      els.proxyStatus.textContent = `GPU mode: ${state.gpuModeLabel || "Unknown"}`;
+      els.proxyStatus.classList.add(
+        state.gpuMode === "openclaw_rl" || state.gpuMode === "heretic_chat" ? "status-good" : "status-bad"
+      );
+      return;
+    }
   }
 
   const splitMode =
@@ -818,6 +1005,9 @@ function renderStatus() {
 
 function renderControls() {
   const disabled = state.busy;
+  const hereticDisabled = state.hereticBusy;
+  const openclawLaneActive = !state.gpuMode || state.gpuMode === "openclaw_rl";
+  const hereticLaneActive = !state.gpuMode || state.gpuMode === "heretic_chat";
   if (state.busy) {
     els.sendButton.disabled = state.stopRequested;
     els.sendButton.setAttribute("aria-label", state.stopRequested ? "Stopping response" : "Stop generating");
@@ -827,36 +1017,72 @@ function renderControls() {
       els.sendButtonIcon.textContent = state.stopRequested ? "…" : "■";
     }
   } else {
-    els.sendButton.disabled = !els.promptInput.value.trim();
+    els.sendButton.disabled = !openclawLaneActive || !els.promptInput.value.trim();
     els.sendButton.setAttribute("aria-label", "Send message");
     els.sendButton.classList.remove("stop-mode", "stop-pending");
     if (els.sendButtonIcon) {
       els.sendButtonIcon.textContent = "➤";
     }
   }
-  els.promptInput.disabled = disabled;
-  els.systemPromptInput.disabled = disabled;
-  els.guidanceInput.disabled = disabled;
-  els.guidanceSaveButton.disabled = disabled;
-  els.newSessionButton.disabled = disabled;
-  const connectedModel = state.model || "Model";
+  els.promptInput.disabled = disabled || !openclawLaneActive;
+  if (els.hereticSendButton) {
+    if (state.hereticBusy) {
+      els.hereticSendButton.disabled = state.hereticStopRequested;
+      els.hereticSendButton.setAttribute(
+        "aria-label",
+        state.hereticStopRequested ? "Stopping 27B response" : "Stop generating"
+      );
+      els.hereticSendButton.classList.add("stop-mode");
+      els.hereticSendButton.classList.toggle("stop-pending", state.hereticStopRequested);
+      if (els.hereticSendButtonIcon) {
+        els.hereticSendButtonIcon.textContent = state.hereticStopRequested ? "…" : "■";
+      }
+    } else {
+      els.hereticSendButton.disabled = !hereticLaneActive || !els.hereticPromptInput.value.trim();
+      els.hereticSendButton.setAttribute("aria-label", "Send 27B chat message");
+      els.hereticSendButton.classList.remove("stop-mode", "stop-pending");
+      if (els.hereticSendButtonIcon) {
+        els.hereticSendButtonIcon.textContent = "➤";
+      }
+    }
+  }
+  if (els.hereticPromptInput) {
+    els.hereticPromptInput.disabled = hereticDisabled || !hereticLaneActive;
+  }
+  if (els.hereticResetButton) {
+    els.hereticResetButton.disabled = hereticDisabled || disabled;
+  }
+  els.systemPromptInput.disabled = disabled || !openclawLaneActive;
+  els.guidanceInput.disabled = disabled || !openclawLaneActive;
+  els.guidanceSaveButton.disabled = disabled || !openclawLaneActive;
+  els.newSessionButton.disabled = disabled || !openclawLaneActive;
+  const connectedModel =
+    state.activeApp === "chat"
+      ? state.model || "Model"
+      : state.activeApp === "heretic"
+        ? state.hereticModel || "27B sidecar model"
+        : getActiveModeModelLabel();
   els.modelLabel.textContent = connectedModel;
+  if (els.gpuModePill) {
+    els.gpuModePill.textContent = state.gpuModeLabel ? `GPU mode: ${state.gpuModeLabel}` : "GPU mode";
+  }
   if (els.thinkingToggle) {
-    els.thinkingToggle.disabled = disabled;
+    els.thinkingToggle.disabled = disabled || !openclawLaneActive;
     els.thinkingToggle.classList.toggle("active", state.thinkingEnabled);
     els.thinkingToggle.setAttribute("aria-pressed", state.thinkingEnabled ? "true" : "false");
     els.thinkingToggle.textContent = state.thinkingEnabled ? "Thinking on" : "Thinking off";
   }
 
   if (els.profileNameInput) {
-    els.profileNameInput.disabled = disabled;
+    els.profileNameInput.disabled = disabled || !openclawLaneActive;
   }
   if (els.profileCreateButton) {
-    els.profileCreateButton.disabled = disabled || !els.profileNameInput.value.trim();
+    els.profileCreateButton.disabled = disabled || !openclawLaneActive || !els.profileNameInput.value.trim();
   }
 
   updateProfileLabels();
   autoResizeComposer();
+  autoResizeHereticComposer();
 }
 
 function renderMessageMetrics(message, item) {
@@ -877,7 +1103,7 @@ function renderMessageMetrics(message, item) {
   speed.textContent = Number.isFinite(tokensPerSecond) && tokensPerSecond > 0 ? `${tokensPerSecond.toFixed(1)} tok/s` : "";
 }
 
-function buildTranscriptMessage(item) {
+function buildTranscriptMessage(item, { allowFeedback = true } = {}) {
   const fragment = els.messageTemplate.content.cloneNode(true);
   const message = fragment.querySelector(".message");
   const roleLabel = message.querySelector(".role-label");
@@ -929,7 +1155,10 @@ function buildTranscriptMessage(item) {
 
   renderMessageMetrics(message, item);
 
-  if (item.role !== "assistant") {
+  if (!allowFeedback) {
+    feedbackControls.remove();
+    feedbackPill.remove();
+  } else if (item.role !== "assistant") {
     feedbackControls.classList.add("hidden");
   } else if (item.streaming) {
     feedbackControls.classList.add("hidden");
@@ -1012,16 +1241,110 @@ function patchTranscriptTurn(turnId) {
 
 function renderTranscript() {
   const shouldStick = !els.transcript.childElementCount || isTranscriptNearBottom();
-  els.transcript.innerHTML = "";
-  const hasMessages = state.transcript.length > 0;
-  els.emptyState.classList.toggle("hidden", hasMessages);
+  renderMessageList(els.transcript, els.emptyState, state.transcript, { shouldStick });
+}
 
-  for (const item of state.transcript) {
-    els.transcript.appendChild(buildTranscriptMessage(item));
+function patchHereticTranscriptTurn(turnId) {
+  if (!turnId || !els.hereticTranscript) {
+    renderHereticTranscript();
+    return;
+  }
+  const item = state.hereticTranscript.find((entry) => entry.id === turnId);
+  if (!item) {
+    renderHereticTranscript();
+    return;
+  }
+  const selector = `.message[data-message-id="${window.CSS && typeof window.CSS.escape === "function" ? window.CSS.escape(turnId) : turnId}"]`;
+  const existing = els.hereticTranscript.querySelector(selector);
+  if (!existing) {
+    renderHereticTranscript();
+    return;
+  }
+  const shouldStick = isHereticTranscriptNearBottom();
+  existing.replaceWith(buildTranscriptMessage(item, { allowFeedback: false }));
+  if (shouldStick) {
+    scrollHereticTranscriptToBottom();
+  }
+}
+
+function renderHereticTranscript() {
+  if (!els.hereticTranscript || !els.hereticEmptyState) {
+    return;
+  }
+  const shouldStick = !els.hereticTranscript.childElementCount || isHereticTranscriptNearBottom();
+  renderMessageList(els.hereticTranscript, els.hereticEmptyState, state.hereticTranscript, {
+    shouldStick,
+    messageOptions: { allowFeedback: false },
+  });
+}
+
+function applyModelControlState(modelControlPayload) {
+  if (!modelControlPayload || typeof modelControlPayload !== "object") {
+    return;
+  }
+  state.modelControl = modelControlPayload;
+  state.gpuMode = modelControlPayload.active_mode || "";
+  state.gpuModeLabel = modelControlPayload.mode_label || "";
+  state.hereticModel = modelControlPayload.heretic?.model || state.hereticModel || "";
+  renderModelControl();
+  renderControls();
+  renderStatus();
+}
+
+function renderModelControl() {
+  if (!els.modelControlModePill) {
+    return;
   }
 
-  if (shouldStick) {
-    scrollTranscriptToBottom();
+  const modelControl = state.modelControl;
+  const openclawLane = modelControl?.openclaw || null;
+  const hereticLane = modelControl?.heretic || null;
+  const openclawActive = state.gpuMode === "openclaw_rl";
+  const hereticActive = state.gpuMode === "heretic_chat";
+
+  els.modelControlModePill.textContent = state.gpuModeLabel ? `Active: ${state.gpuModeLabel}` : "Checking mode...";
+
+  if (els.openclawModeCard) {
+    els.openclawModeCard.classList.toggle("active-mode-card", openclawActive);
+  }
+  if (els.hereticModeCard) {
+    els.hereticModeCard.classList.toggle("active-mode-card", hereticActive);
+  }
+
+  if (els.openclawModeStatus) {
+    els.openclawModeStatus.textContent = openclawActive ? "Active" : "Inactive";
+  }
+  if (els.hereticModeStatus) {
+    els.hereticModeStatus.textContent = hereticActive ? "Active" : "Inactive";
+  }
+  if (els.openclawModeModel) {
+    els.openclawModeModel.textContent = openclawLane?.model ? `Model: ${openclawLane.model}` : "Model: unavailable";
+  }
+  if (els.hereticModeModel) {
+    els.hereticModeModel.textContent = hereticLane?.model ? `Model: ${hereticLane.model}` : "Model: unavailable";
+  }
+  if (els.openclawModeHealth) {
+    els.openclawModeHealth.textContent = `Health: ${openclawLane?.ready ? "ready" : "unavailable"}`;
+  }
+  if (els.hereticModeHealth) {
+    els.hereticModeHealth.textContent = `Health: ${hereticLane?.ready ? "ready" : "unavailable"}`;
+  }
+  if (els.openclawModeButton) {
+    els.openclawModeButton.disabled = state.busy || state.hereticBusy || openclawActive;
+    els.openclawModeButton.textContent = openclawActive ? "OpenClaw RL active" : "Use OpenClaw RL";
+  }
+  if (els.hereticModeButton) {
+    els.hereticModeButton.disabled = state.busy || state.hereticBusy || hereticActive;
+    els.hereticModeButton.textContent = hereticActive ? "27B Chat active" : "Use 27B Chat";
+  }
+  if (els.hereticStatusChip) {
+    if (!modelControl) {
+      els.hereticStatusChip.textContent = "Checking 27B Chat...";
+    } else if (state.gpuMode !== "heretic_chat") {
+      els.hereticStatusChip.textContent = "Mode set to OpenClaw RL";
+    } else {
+      els.hereticStatusChip.textContent = hereticLane?.ready ? "27B chat connected" : "27B chat unavailable";
+    }
   }
 }
 
@@ -1037,12 +1360,16 @@ function applyProfilesState(profilePayload) {
   renderControls();
 }
 
-function applyServerState(serverState, proxyState = null, profilePayload = null) {
+function applyServerState(serverState, profilePayload = null) {
   state.transcript = serverState.transcript || [];
+  state.hereticTranscript = serverState.heretic_transcript || [];
   state.busy = Boolean(serverState.busy);
+  state.hereticBusy = Boolean(serverState.heretic_busy);
   state.stopRequested = Boolean(serverState.stop_requested) && state.busy;
-  document.body.classList.toggle("busy", state.busy);
+  state.hereticStopRequested = Boolean(serverState.heretic_stop_requested) && state.hereticBusy;
+  document.body.classList.toggle("busy", state.busy || state.hereticBusy);
   state.model = serverState.model || "";
+  state.hereticModel = serverState.heretic_model || state.hereticModel || "";
   state.backendMode = serverState.backend_mode || "rl_proxy";
   state.chatBackendMode = serverState.chat_backend_mode || state.backendMode;
   state.trainingBackendMode = serverState.training_backend_mode || state.backendMode;
@@ -1068,12 +1395,17 @@ function applyServerState(serverState, proxyState = null, profilePayload = null)
       : "No saved system prompt or notes yet."
   );
 
-  if (proxyState) {
-    state.proxyHealth = proxyState;
-    state.proxyOk = Boolean(proxyState.ok);
+  if (serverState.proxy) {
+    state.proxyHealth = serverState.proxy;
+    state.proxyOk = Boolean(serverState.proxy.ok);
+  }
+
+  if (serverState.model_control) {
+    applyModelControlState(serverState.model_control);
   }
 
   renderTranscript();
+  renderHereticTranscript();
   renderSessions();
   renderControls();
   renderStatus();
@@ -1170,17 +1502,24 @@ async function readSseStream(response, onEvent) {
 }
 
 async function refreshState() {
-  const [statePayload, statusPayload, profilesPayload] = await Promise.all([
-    fetchJson("/api/state"),
+  const [statusPayload, profilesPayload] = await Promise.all([
     fetchJson("/api/status"),
     fetchJson("/api/profiles"),
   ]);
-  applyServerState(statePayload.state, statusPayload.state.proxy, profilesPayload);
+  applyServerState(statusPayload.state, profilesPayload);
 }
 
 async function refreshProfiles() {
   const payload = await fetchJson("/api/profiles");
-  applyServerState(payload.state, { ok: state.proxyOk !== false }, payload);
+  applyServerState(payload.state, payload);
+}
+
+async function refreshModelControl() {
+  const payload = await fetchJson("/api/model-control");
+  applyModelControlState(payload.model_control);
+  if (payload.state) {
+    applyServerState(payload.state);
+  }
 }
 
 async function sendPrompt() {
@@ -1242,7 +1581,7 @@ async function sendPrompt() {
       }
 
       if (eventName === "state") {
-        applyServerState(payload.state, { ok: true });
+        applyServerState(payload.state);
         return;
       }
 
@@ -1294,6 +1633,196 @@ async function stopPrompt() {
   }
 }
 
+function upsertHereticStreamingTurn(turn) {
+  const existingIndex = state.hereticTranscript.findIndex((item) => item.id === turn.id);
+  if (existingIndex === -1) {
+    state.hereticTranscript.push(turn);
+    return;
+  }
+  Object.assign(state.hereticTranscript[existingIndex], turn);
+}
+
+function appendHereticStreamingDelta(turnId, delta, reasoningDelta = "", metrics = null) {
+  const existingIndex = state.hereticTranscript.findIndex((item) => item.id === turnId);
+  if (existingIndex === -1) {
+    return;
+  }
+  const current = state.hereticTranscript[existingIndex];
+  const nextMetrics = hasStreamMetrics(metrics)
+    ? { ...(current.metrics && typeof current.metrics === "object" ? current.metrics : {}), ...metrics }
+    : current.metrics || null;
+  state.hereticTranscript[existingIndex] = {
+    ...current,
+    content: `${current.content || ""}${delta || ""}`,
+    reasoning: `${current.reasoning || ""}${reasoningDelta || ""}`,
+    metrics: nextMetrics,
+    streaming: true,
+  };
+}
+
+function setHereticStreamingMetrics(turnId, metrics = null) {
+  if (!hasStreamMetrics(metrics)) {
+    return;
+  }
+  const existingIndex = state.hereticTranscript.findIndex((item) => item.id === turnId);
+  if (existingIndex === -1) {
+    return;
+  }
+  state.hereticTranscript[existingIndex] = {
+    ...state.hereticTranscript[existingIndex],
+    metrics: {
+      ...(state.hereticTranscript[existingIndex].metrics && typeof state.hereticTranscript[existingIndex].metrics === "object"
+        ? state.hereticTranscript[existingIndex].metrics
+        : {}),
+      ...metrics,
+    },
+  };
+}
+
+function clearHereticStreamingTurns() {
+  state.hereticTranscript = state.hereticTranscript.filter((item) => !item.ephemeral);
+}
+
+async function sendHereticPrompt() {
+  const prompt = els.hereticPromptInput.value.trim();
+  if (!prompt || state.hereticBusy) {
+    return;
+  }
+
+  state.hereticStopRequested = false;
+  setHereticBusy(true);
+  const controller = new AbortController();
+  try {
+    const response = await fetch("/api/heretic/chat/stream", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({ prompt }),
+    });
+
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      const detail = payload.detail || `Request failed with ${response.status}`;
+      throw new Error(detail);
+    }
+
+    els.hereticPromptInput.value = "";
+    autoResizeHereticComposer();
+    renderControls();
+
+    await readSseStream(response, (eventName, payload) => {
+      if (eventName === "start") {
+        if (payload.user_turn) {
+          upsertHereticStreamingTurn({ ...payload.user_turn, ephemeral: true, feedback_pending: false });
+        }
+        if (payload.assistant_turn) {
+          upsertHereticStreamingTurn({ ...payload.assistant_turn, ephemeral: true, feedback_pending: false });
+        }
+        renderHereticTranscript();
+        return;
+      }
+
+      if (eventName === "delta") {
+        appendHereticStreamingDelta(
+          payload.assistant_turn_id,
+          payload.delta || "",
+          payload.reasoning_delta || "",
+          payload.metrics || null
+        );
+        patchHereticTranscriptTurn(payload.assistant_turn_id);
+        return;
+      }
+
+      if (eventName === "final") {
+        setHereticStreamingMetrics(payload.assistant_turn_id, payload.metrics || null);
+        patchHereticTranscriptTurn(payload.assistant_turn_id);
+        return;
+      }
+
+      if (eventName === "state") {
+        applyServerState(payload.state);
+        return;
+      }
+
+      if (eventName === "error") {
+        clearHereticStreamingTurns();
+        renderHereticTranscript();
+        throw new Error(payload.detail || "Streaming failed.");
+      }
+    });
+
+    if (state.hereticBusy) {
+      await refreshState();
+    }
+  } catch (error) {
+    if (error.name === "AbortError" && state.hereticStopRequested) {
+      finalizeStoppedHereticStream();
+      return;
+    }
+    try {
+      await refreshState();
+    } catch (_refreshError) {
+      // Keep original error.
+    }
+    window.alert(error.message);
+    setHereticBusy(false);
+  }
+}
+
+async function stopHereticPrompt() {
+  if (!state.hereticBusy || state.hereticStopRequested) {
+    return;
+  }
+
+  state.hereticStopRequested = true;
+  renderControls();
+  try {
+    fetch("/api/heretic/chat/stop", { method: "POST", credentials: "same-origin", keepalive: true }).catch(() => {});
+  } catch (error) {
+    state.hereticStopRequested = false;
+    renderControls();
+    window.alert(error.message);
+  }
+}
+
+async function resetHereticChat() {
+  if (state.busy || state.hereticBusy) {
+    return;
+  }
+  setHereticBusy(true);
+  try {
+    const payload = await fetchJson("/api/heretic/reset", {
+      method: "POST",
+      body: "{}",
+    });
+    applyServerState(payload.state);
+  } catch (error) {
+    window.alert(error.message);
+    setHereticBusy(false);
+  }
+}
+
+async function switchGpuMode(mode) {
+  if (!mode || state.busy || state.hereticBusy) {
+    return;
+  }
+
+  document.body.classList.add("busy");
+  try {
+    const payload = await fetchJson("/api/model-control/switch", {
+      method: "POST",
+      body: JSON.stringify({ mode }),
+    });
+    applyModelControlState(payload.model_control);
+    applyServerState(payload.state);
+    await refreshState();
+  } catch (error) {
+    window.alert(error.message);
+    document.body.classList.toggle("busy", state.busy || state.hereticBusy);
+  }
+}
+
 async function sendFeedback(assistantTurnId) {
   if (state.busy) {
     return;
@@ -1315,7 +1844,7 @@ async function sendFeedback(assistantTurnId) {
       }),
     });
     feedbackDrafts.delete(assistantTurnId);
-    applyServerState(payload.state, { ok: true });
+    applyServerState(payload.state);
   } catch (error) {
     window.alert(error.message);
     setBusy(false);
@@ -1332,7 +1861,7 @@ async function saveGuidance() {
         system_prompt_text: els.systemPromptInput.value,
       }),
     });
-    applyServerState(payload.state, { ok: state.proxyOk !== false });
+    applyServerState(payload.state);
     setGuidanceStatus(
       payload.state.system_prompt_text || payload.state.guidance_text
         ? "System prompt and notes saved for this profile."
@@ -1360,7 +1889,7 @@ async function selectProfile(profileId) {
     els.promptInput.value = "";
     autoResizeComposer();
     feedbackDrafts.clear();
-    applyServerState(payload.state, { ok: state.proxyOk !== false }, payload);
+    applyServerState(payload.state, payload);
     setGuidanceStatus(
       payload.state.system_prompt_text || payload.state.guidance_text
         ? "Loaded saved system prompt and notes for this profile."
@@ -1395,7 +1924,7 @@ async function createProfile() {
     els.promptInput.value = "";
     autoResizeComposer();
     feedbackDrafts.clear();
-    applyServerState(payload.state, { ok: state.proxyOk !== false }, payload);
+    applyServerState(payload.state, payload);
     setGuidanceStatus(
       payload.state.system_prompt_text || payload.state.guidance_text
         ? "Loaded saved system prompt and notes for the new profile."
@@ -1422,7 +1951,7 @@ async function createSession() {
     els.promptInput.value = "";
     autoResizeComposer();
     feedbackDrafts.clear();
-    applyServerState(payload.state, { ok: state.proxyOk !== false });
+    applyServerState(payload.state);
   } catch (error) {
     window.alert(error.message);
     setBusy(false);
@@ -1440,7 +1969,7 @@ async function toggleThinking() {
       method: "POST",
       body: JSON.stringify({ enabled: !state.thinkingEnabled }),
     });
-    applyServerState(payload.state, { ok: state.proxyOk !== false });
+    applyServerState(payload.state);
   } catch (error) {
     window.alert(error.message);
     setBusy(false);
@@ -1461,7 +1990,7 @@ async function selectSession(sessionId) {
     els.promptInput.value = "";
     autoResizeComposer();
     feedbackDrafts.clear();
-    applyServerState(payload.state, { ok: state.proxyOk !== false });
+    applyServerState(payload.state);
   } catch (error) {
     window.alert(error.message);
     setBusy(false);
@@ -1475,6 +2004,15 @@ els.sendButton.addEventListener("click", () => {
   }
   sendPrompt();
 });
+if (els.hereticSendButton) {
+  els.hereticSendButton.addEventListener("click", () => {
+    if (state.hereticBusy) {
+      stopHereticPrompt();
+      return;
+    }
+    sendHereticPrompt();
+  });
+}
 els.guidanceSaveButton.addEventListener("click", saveGuidance);
 els.newSessionButton.addEventListener("click", createSession);
 if (els.thinkingToggle) {
@@ -1488,6 +2026,11 @@ if (els.profileCreateButton) {
 els.promptInput.addEventListener("input", () => {
   renderControls();
 });
+if (els.hereticPromptInput) {
+  els.hereticPromptInput.addEventListener("input", () => {
+    renderControls();
+  });
+}
 
 els.promptInput.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) {
@@ -1495,6 +2038,14 @@ els.promptInput.addEventListener("keydown", (event) => {
     sendPrompt();
   }
 });
+if (els.hereticPromptInput) {
+  els.hereticPromptInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      sendHereticPrompt();
+    }
+  });
+}
 
 if (els.systemPromptInput) {
   els.systemPromptInput.addEventListener("input", () => {
@@ -1544,11 +2095,27 @@ if (els.calendarSaveButton) {
 if (els.calendarClearButton) {
   els.calendarClearButton.addEventListener("click", clearCalendarDay);
 }
+if (els.hereticResetButton) {
+  els.hereticResetButton.addEventListener("click", resetHereticChat);
+}
+if (els.openclawModeButton) {
+  els.openclawModeButton.addEventListener("click", () => {
+    switchGpuMode("openclaw_rl");
+  });
+}
+if (els.hereticModeButton) {
+  els.hereticModeButton.addEventListener("click", () => {
+    switchGpuMode("heretic_chat");
+  });
+}
 
 setProfileCreateStatus("Create a new saved training profile.");
 autoResizeComposer();
+autoResizeHereticComposer();
 renderShell();
 renderCalendar();
+renderHereticTranscript();
+renderModelControl();
 
 refreshState().catch((error) => {
   state.proxyOk = false;

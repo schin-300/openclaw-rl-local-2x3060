@@ -505,6 +505,7 @@ button:disabled {
 .sidebar-footer {
   display: flex;
   gap: 8px;
+  flex-wrap: wrap;
   padding: 14px 4px 2px;
 }
 
@@ -757,6 +758,72 @@ input[type="text"] {
 
 .composer-shell {
   padding: 18px 24px 24px;
+}
+
+.heretic-shell,
+.model-control-shell {
+  min-height: 100%;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 18px;
+  padding-bottom: 28px;
+}
+
+.model-control-shell {
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.heretic-transcript-shell {
+  position: relative;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.heretic-transcript {
+  width: min(var(--chat-content-width), calc(100% - 8px));
+}
+
+.model-control-layout {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+  padding: 0 28px;
+}
+
+.mode-card {
+  display: grid;
+  align-content: start;
+  gap: 14px;
+  padding: 22px;
+  border-radius: 24px;
+  border: 1px solid var(--bg-border);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.mode-card.active-mode-card {
+  border-color: rgba(45, 127, 249, 0.28);
+  background: rgba(45, 127, 249, 0.08);
+}
+
+.mode-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.mode-card-head h3 {
+  margin: 0;
+  font-size: 24px;
+  font-weight: 520;
+  letter-spacing: -0.03em;
+}
+
+.mode-card-copy {
+  margin: 0;
+  color: var(--text-secondary);
+  line-height: 1.55;
 }
 
 .composer-frame {
@@ -1170,6 +1237,10 @@ textarea:focus {
   .settings-body {
     grid-template-columns: 1fr;
   }
+
+  .model-control-layout {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 960px) {
@@ -1240,7 +1311,8 @@ textarea:focus {
   .app-view-head,
   .notes-body,
   .settings-body,
-  .calendar-layout {
+  .calendar-layout,
+  .model-control-layout {
     padding-left: 14px;
     padding-right: 14px;
   }
